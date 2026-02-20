@@ -49,8 +49,8 @@ def patch_llama(model: torch.nn.Module) -> torch.nn.Module:
 
     Replaces:
     - RMSNorm with fused RMSNorm kernel
-    - Attention with FlashAttention + fused RoPE
-    - Loss with chunked cross-entropy
+    - Attention with FlashAttention + fused RoPE (Phase 5)
+    - Loss with chunked cross-entropy (Phase 4)
 
     Args:
         model: A LlamaForCausalLM or compatible model
@@ -58,8 +58,42 @@ def patch_llama(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
-    # TODO: Implement actual patching once kernels are ready
-    # This is a placeholder for Phase 3-5
+    from barqtrain.ops import fused_rms_norm
+
+    try:
+        import transformers.models.llama.modeling_llama as llama_model
+    except ImportError:
+        return model
+
+    # Patch all RMSNorm layers
+    patched_count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, llama_model.LlamaRMSNorm):
+            # Store original weight
+            original_weight = module.weight.data.clone()
+            original_eps = module.variance_epsilon
+
+            # Replace forward with fused version
+            def make_forward(eps=original_eps):
+                def forward(self, x):
+                    return fused_rms_norm(x, self.weight, eps)
+                return forward
+
+            # Monkey-patch the forward method
+            import types
+            module.forward = types.MethodType(make_forward(), module)
+
+            # Ensure weight is on correct device
+            module.weight.data = original_weight
+
+            patched_count += 1
+
+    if patched_count > 0:
+        print(f"BarqTrain: Patched {patched_count} RMSNorm layer(s) with fused kernel")
+
+    # TODO: Add attention patching in Phase 5
+    # TODO: Add loss patching in Phase 4
+
     return model
 
 
