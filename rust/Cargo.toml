@@ -1,0 +1,23 @@
+[package]
+name = "barqtrain-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust data pipeline components for BarqTrain"
+authors = ["BarqTrain Contributors"]
+
+[lib]
+name = "barqtrain_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"] }
+rayon = "1.8"
+numpy = "0.20"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
