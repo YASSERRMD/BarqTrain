@@ -32,6 +32,14 @@ std::vector<torch::Tensor> chunked_cross_entropy_cuda(
     torch::Tensor labels
 );
 
+torch::Tensor fused_lora_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor W_base,
+    torch::Tensor A,
+    torch::Tensor B,
+    float scaling
+);
+
 // Python module definition
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "BarqTrain CUDA kernels for high-performance LLM fine-tuning";
@@ -49,4 +57,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Chunked Cross-Entropy functions
     m.def("chunked_cross_entropy", &chunked_cross_entropy_cuda,
           "Chunked cross-entropy loss avoiding logit materialization (CUDA)");
+
+    // LoRA functions
+    m.def("fused_lora_forward", &fused_lora_forward_cuda,
+          "Fused LoRA forward: x @ W_base + (x @ A) @ B (CUDA)");
 }

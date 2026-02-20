@@ -23,6 +23,7 @@ set(SRC_FILES
     kernels/rmsnorm.cu
     kernels/flash_attention.cu
     kernels/chunked_cross_entropy.cu
+    kernels/lora.cu
 )
 
 # Build the shared library
