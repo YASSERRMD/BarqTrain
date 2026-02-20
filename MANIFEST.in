@@ -1,0 +1,11 @@
+include README.md
+include LICENSE
+include IMPLEMENTATION_PLAN.md
+include pyproject.toml
+recursive-include python/barqtrain *.py
+recursive-include csrc *.cpp *.cu *.h
+recursive-include rust/src *.rs
+recursive-include tests *.py
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude .git*
