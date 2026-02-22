@@ -28,13 +28,31 @@ LONG_DESCRIPTION = (Path(__file__).parent / "README.md").read_text(encoding="utf
 
 
 def build_cuda_extension():
-    """Build the CUDA C++ extension if CUDA is available."""
+    """Build the CUDA C++ extension.
+
+    Only attempted when BARQTRAIN_BUILD_CUDA=1 is set in the environment.
+    This prevents accidental compilation during plain `pip install -e .`
+    on machines that happen to have CUDA installed (e.g. Google Colab).
+
+    To build::
+
+        BARQTRAIN_BUILD_CUDA=1 pip install -e .
+    """
+    # Opt-in only: require explicit env var
+    if not os.environ.get("BARQTRAIN_BUILD_CUDA", ""):
+        return None
     if not _TORCH_AVAILABLE:
+        print("Warning: torch not available, skipping CUDA extension build")
         return None
     try:
         from torch.utils.cpp_extension import CUDA_HOME
 
-        if CUDA_HOME is None and not os.path.exists("csrc"):
+        if CUDA_HOME is None:
+            print("Warning: CUDA_HOME not set, skipping CUDA extension build")
+            return None
+
+        if not os.path.exists("csrc"):
+            print("Warning: csrc/ directory not found, skipping CUDA extension build")
             return None
 
         # Source files for CUDA extension
@@ -124,6 +142,8 @@ def build_rust_extension():
         return None
 
 
+_cuda_ext = build_cuda_extension()
+
 # Setup configuration
 setup(
     name=PROJECT_NAME,
@@ -160,8 +180,8 @@ setup(
             "wandb>=0.15.0",
         ],
     },
-    ext_modules=[ext for ext in [build_cuda_extension()] if ext is not None],
-    cmdclass={"build_ext": BuildExtension} if (build_cuda_extension() and BuildExtension) else {},
+    ext_modules=[_cuda_ext] if _cuda_ext is not None else [],
+    cmdclass={"build_ext": BuildExtension} if (_cuda_ext is not None and BuildExtension) else {},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
