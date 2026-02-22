@@ -12,28 +12,121 @@
 
 ## Installation
 
-### From Source
+### Google Colab (NVIDIA GPU) 🚀
+
+BarqTrain works out of the box on Colab's GPU runtimes — no manual setup needed.
+
+**Step 1 — Select a GPU runtime**
+
+`Runtime → Change runtime type → Hardware accelerator → T4 / A100 / L4`
+
+**Step 2 — Clone & install in a notebook cell**
+
+```python
+# Cell 1 – clone
+!git clone https://github.com/YASSERRMD/BarqTrain.git
+%cd BarqTrain
+
+# Cell 2 – install (pure-Python, no compilation needed)
+!pip install -e .
+```
+
+**Step 3 — (Optional) Compile CUDA kernels for maximum performance**
+
+The CUDA kernels give the biggest speedups. Compilation takes ~2 min on Colab.
+
+```python
+# Cell 3 – compile CUDA kernels (T4 / A100 / L4 / V100 all supported)
+!BARQTRAIN_BUILD_CUDA=1 pip install -e .
+
+# Verify the CUDA extension loaded
+import barqtrain_cuda
+print("CUDA extension loaded ✓")
+```
+
+**Step 4 — Full Colab example: fine-tune Llama-3 on a custom dataset**
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from datasets import load_dataset
+from barqtrain import patch_model
+
+# Load model (bfloat16 to fit in Colab VRAM)
+model_id = "meta-llama/Meta-Llama-3-8B"   # swap for any HF model
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",          # auto-places on the Colab GPU
+)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+# Apply BarqTrain fused kernels (RMSNorm, FlashAttention, chunked CE)
+patch_model(model)
+print("BarqTrain patches applied ✓")
+
+# Load dataset
+dataset = load_dataset("tatsu-lab/alpaca", split="train[:1000]")
+
+def tokenize(example):
+    return tokenizer(
+        example["text"], truncation=True, max_length=512, padding="max_length"
+    )
+
+tokenized = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+
+# Train
+args = TrainingArguments(
+    output_dir="./barqtrain-output",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
+    num_train_epochs=1,
+    bf16=True,                  # use bfloat16 on Colab A100/L4/T4
+    logging_steps=10,
+    save_strategy="epoch",
+)
+
+trainer = Trainer(model=model, args=args, train_dataset=tokenized)
+trainer.train()
+```
+
+> **Tip:** On a free Colab T4 (16 GB VRAM), use `per_device_train_batch_size=1`
+> and `gradient_accumulation_steps=8`. On A100 (40 GB), you can use batch size 4-8.
+
+**Verify GPU is active and VRAM usage:**
+
+```python
+!nvidia-smi
+import torch
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+```
+
+---
+
+### Local (from source)
 
 ```bash
 # Clone the repository
 git clone https://github.com/YASSERRMD/BarqTrain.git
 cd BarqTrain
 
-# Install Python dependencies
+# Install Python package (no compilation required)
 pip install -e .
 
-# Build CUDA extension (requires CUDA toolkit)
-cd csrc
-mkdir build && cd build
-cmake ..
-make -j
+# Optional: build CUDA kernels (requires NVIDIA GPU + CUDA toolkit)
+BARQTRAIN_BUILD_CUDA=1 pip install -e .
 
-# Build Rust extension
+# Optional: build via CMake directly
+cd csrc && mkdir build && cd build
+cmake ..        # auto-detects PyTorch cmake prefix
+make -j$(nproc)
+
+# Optional: build Rust extension (requires Rust + maturin)
 cd ../../rust
 maturin develop --release
 ```
 
-### Quick Start
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
