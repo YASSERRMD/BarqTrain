@@ -40,6 +40,24 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 /**
+ * Atomic max for floats using CAS (Compare-And-Swap) on bit-cast unsigned int.
+ * CUDA's built-in atomicMax only supports int/uint/long long.
+ */
+__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
+    // Positive floats have the same bit ordering as unsigned ints,
+    // so a CAS loop on the reinterpreted bits gives us a correct float atomicMax.
+    unsigned int* addr_as_uint = reinterpret_cast<unsigned int*>(addr);
+    unsigned int old = *addr_as_uint;
+    unsigned int assumed;
+    do {
+        assumed = old;
+        float old_float = __uint_as_float(assumed);
+        if (old_float >= val) break;  // current value already >= val, done
+        old = atomicCAS(addr_as_uint, assumed, __float_as_uint(val));
+    } while (assumed != old);
+}
+
+/**
  * First pass: Find maximum logit value for numerical stability
  * Processes vocabulary in chunks to avoid materializing full logits
  */
@@ -122,9 +140,9 @@ __global__ void chunked_cross_entropy_max_kernel(
         max_logit = fmaxf(max_logit, warp_reduce_max(local_max));
     }
 
-    // Final reduction across warps
+    // Final reduction across warps using float-safe atomic max
     if (tid % 32 == 0) {
-        atomicMax(&max_logits[batch_idx * seq_len + seq_idx], max_logit);
+        atomicMaxFloat(&max_logits[batch_idx * seq_len + seq_idx], max_logit);
     }
 }
 
