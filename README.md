@@ -36,13 +36,20 @@ BarqTrain works out of the box on Colab's GPU runtimes — no manual setup neede
 The CUDA kernels give the biggest speedups. Compilation takes ~2 min on Colab.
 
 ```python
-# Cell 3 – compile CUDA kernels (T4 / A100 / L4 / V100 all supported)
+# Cell 3a – install Python dev headers (required to compile C extensions)
+# Without this you get: fatal error: Python.h: No such file or directory
+!apt-get install -y python3-dev
+
+# Cell 3b – compile CUDA kernels (T4 / A100 / L4 / V100 all supported)
 !BARQTRAIN_BUILD_CUDA=1 pip install -e .
 
 # Verify the CUDA extension loaded
 import barqtrain_cuda
 print("CUDA extension loaded ✓")
 ```
+
+> **Note:** `python3-dev` is not pre-installed on Colab. It provides `Python.h`
+> which is required when compiling any C/C++ extension that embeds Python.
 
 **Step 4 — Full Colab example: fine-tune Llama-3 on a custom dataset**
 
