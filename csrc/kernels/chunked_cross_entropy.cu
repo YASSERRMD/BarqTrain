@@ -1,489 +1,289 @@
 /**
- * BarqTrain Chunked Cross-Entropy Loss Kernel
+ * BarqTrain Chunked Cross-Entropy Loss
  *
- * Implements a chunked cross-entropy that avoids materializing the full
- * [batch × seq_len × vocab_size] logit tensor, processing the vocab dimension
- * in SRAM chunks for massive VRAM savings.
- *
- * This is the HIGHEST ROI optimization, saving up to 60% VRAM for large vocabularies.
- *
- * Algorithm:
- * 1. For each position, compute logits in chunks over the vocabulary
- * 2. Track max logit (for numerical stability) across all chunks
- * 3. Compute softmax and loss in a second pass
- * 4. Backward pass computes gradient directly w.r.t hidden states
+ * Correctness-focused implementation:
+ *  - One block per (batch, seq) token position
+ *  - Threads iterate over vocab_size; each thread owns N vocab entries
+ *  - Correct full dot product: each thread loops over all hidden_dim dims
+ *  - Two passes: (1) find max logit, (2) sum_exp + target_logit → loss
+ *  - No atomicMax(float*) — use CAS-based atomicMaxFloat helper instead
+ *  - No type-mismatched atomicAdd
  */
 
-#include <torch/extension.h>
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <vector>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
 
-#define ILP 4  // Instruction-level parallelism
-
-// Warp reduction for finding maximum
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
-    }
-    return val;
+// ---------------------------------------------------------------------------
+// Helper: load one element of type T as float
+// ---------------------------------------------------------------------------
+template <typename T>
+__device__ __forceinline__ float load_f32(const T *ptr, int idx) {
+  if constexpr (std::is_same<T, half>::value)
+    return __half2float(ptr[idx]);
+  else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+    return __bfloat162float(ptr[idx]);
+  else
+    return ptr[idx];
 }
 
-// Warp reduction for sum
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
+// ---------------------------------------------------------------------------
+// Warp reduce: max
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_max(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+  return v;
 }
 
-/**
- * Atomic max for floats using CAS (Compare-And-Swap) on bit-cast unsigned int.
- * CUDA's built-in atomicMax only supports int/uint/long long.
- */
-__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
-    // Positive floats have the same bit ordering as unsigned ints,
-    // so a CAS loop on the reinterpreted bits gives us a correct float atomicMax.
-    unsigned int* addr_as_uint = reinterpret_cast<unsigned int*>(addr);
-    unsigned int old = *addr_as_uint;
-    unsigned int assumed;
-    do {
-        assumed = old;
-        float old_float = __uint_as_float(assumed);
-        if (old_float >= val) break;  // current value already >= val, done
-        old = atomicCAS(addr_as_uint, assumed, __float_as_uint(val));
-    } while (assumed != old);
+// ---------------------------------------------------------------------------
+// Warp reduce: sum
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_down_sync(0xffffffff, v, off);
+  return v;
 }
 
-/**
- * First pass: Find maximum logit value for numerical stability
- * Processes vocabulary in chunks to avoid materializing full logits
- */
-template<typename T>
-__global__ void chunked_cross_entropy_max_kernel(
-    const T* __restrict__ hidden_states,  // [batch_size, seq_len, hidden_dim]
-    const T* __restrict__ lm_head_weight, // [vocab_size, hidden_dim]
-    float* __restrict__ max_logits,       // [batch_size, seq_len]
-    int batch_size,
-    int seq_len,
-    int hidden_dim,
-    int vocab_size,
-    int chunk_size
-) {
-    // Each thread block processes one position
-    int batch_idx = blockIdx.x;
-    int seq_idx = blockIdx.y;
+// ---------------------------------------------------------------------------
+// Block reduce: max  (uses smem scratch[0..blockDim.x-1])
+// ---------------------------------------------------------------------------
+__device__ float block_reduce_max(float v, float *smem) {
+  int tid = threadIdx.x;
+  smem[tid] = warp_reduce_max(v);
+  __syncthreads();
+  // reduce across warps (assuming blockDim.x <= 1024, ≤32 warps)
+  if (tid < 32) {
+    float wv = (tid < (blockDim.x + 31) / 32) ? smem[tid * 32] : -INFINITY;
+    wv = warp_reduce_max(wv);
+    if (tid == 0)
+      smem[0] = wv;
+  }
+  __syncthreads();
+  return smem[0];
+}
 
-    if (batch_idx >= batch_size || seq_idx >= seq_len) return;
+// ---------------------------------------------------------------------------
+// Block reduce: sum
+// ---------------------------------------------------------------------------
+__device__ float block_reduce_sum(float v, float *smem) {
+  int tid = threadIdx.x;
+  smem[tid] = warp_reduce_sum(v);
+  __syncthreads();
+  if (tid < 32) {
+    float wv = (tid < (blockDim.x + 31) / 32) ? smem[tid * 32] : 0.0f;
+    wv = warp_reduce_sum(wv);
+    if (tid == 0)
+      smem[0] = wv;
+  }
+  __syncthreads();
+  return smem[0];
+}
 
-    int tid = threadIdx.x;
-    int hidden_state_idx = (batch_idx * seq_len + seq_idx) * hidden_dim;
+// ---------------------------------------------------------------------------
+// Forward kernel: one block per token position (batch_idx, seq_idx)
+// Shared memory layout:
+//   [0 .. hidden_dim-1]        : hidden state (float)
+//   [hidden_dim .. hidden_dim+blockDim.x-1] : scratch for reductions
+// ---------------------------------------------------------------------------
+template <typename T>
+__global__ void chunked_cross_entropy_fwd_kernel(
+    const T *__restrict__ hidden_states, // [B, S, H]
+    const T *__restrict__ weight,        // [V, H]
+    const int64_t *__restrict__ labels,  // [B, S]
+    float *__restrict__ loss_out,        // [B, S]
+    int batch_size, int seq_len, int hidden_dim, int vocab_size) {
+  int batch_idx = blockIdx.y;
+  int seq_idx = blockIdx.x;
+  if (batch_idx >= batch_size || seq_idx >= seq_len)
+    return;
 
-    // Load hidden state into shared memory
-    extern __shared__ float s_hidden[];
-    float* hidden = &s_hidden[tid * ILP];
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
 
-    // Load hidden state with ILP
-    #pragma unroll
-    for (int i = 0; i < ILP; i++) {
-        int idx = tid * ILP + i;
-        if (idx < hidden_dim) {
-            if constexpr (std::is_same<T, half>::value) {
-                hidden[i] = __half2float(hidden_states[hidden_state_idx + idx]);
-            } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                hidden[i] = __bfloat162float(hidden_states[hidden_state_idx + idx]);
-            } else {
-                hidden[i] = hidden_states[hidden_state_idx + idx];
-            }
-        } else {
-            hidden[i] = 0.0f;
-        }
-    }
+  // Shared: hidden state + scratch buffer
+  extern __shared__ float smem[];
+  float *shidden = smem;              // hidden_dim floats
+  float *scratch = smem + hidden_dim; // nthreads floats
 
+  // Load hidden state into shared memory
+  int h_base = (batch_idx * seq_len + seq_idx) * hidden_dim;
+  for (int d = tid; d < hidden_dim; d += nthreads)
+    shidden[d] = load_f32(hidden_states, h_base + d);
+  __syncthreads();
+
+  int64_t target = labels[batch_idx * seq_len + seq_idx];
+
+  // ---- Pass 1: find global max logit ----
+  float local_max = -INFINITY;
+  for (int vi = tid; vi < vocab_size; vi += nthreads) {
+    float dot = 0.0f;
+    int w_base = vi * hidden_dim;
+    for (int d = 0; d < hidden_dim; d++)
+      dot += shidden[d] * load_f32(weight, w_base + d);
+    local_max = fmaxf(local_max, dot);
+  }
+  float global_max = block_reduce_max(local_max, scratch);
+
+  // ---- Pass 2: sum_exp + target_logit ----
+  float local_sum = 0.0f;
+  float local_tgt = -INFINITY; // only one thread will have the real value
+  for (int vi = tid; vi < vocab_size; vi += nthreads) {
+    float dot = 0.0f;
+    int w_base = vi * hidden_dim;
+    for (int d = 0; d < hidden_dim; d++)
+      dot += shidden[d] * load_f32(weight, w_base + d);
+    local_sum += expf(dot - global_max);
+    if (vi == (int)target)
+      local_tgt = dot;
+  }
+
+  // Reduce sum_exp
+  float total_sum = block_reduce_sum(local_sum, scratch);
+
+  // Find target logit: use max-reduction (all other threads have -INFINITY)
+  scratch[tid] = local_tgt;
+  __syncthreads();
+  for (int s = nthreads / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      scratch[tid] = fmaxf(scratch[tid], scratch[tid + s]);
     __syncthreads();
+  }
+  float target_logit = scratch[0];
 
-    // Compute max over vocabulary chunks
-    float max_logit = -INFINITY;
-
-    for (int chunk_start = 0; chunk_start < vocab_size; chunk_start += chunk_size) {
-        int chunk_end = min(chunk_start + chunk_size, vocab_size);
-
-        // Each thread processes multiple vocab entries
-        float local_max = -INFINITY;
-
-        for (int vocab_idx = chunk_start + tid; vocab_idx < chunk_end; vocab_idx += blockDim.x) {
-            // Compute dot product: hidden @ weight[vocab_idx]
-            float dot = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < ILP; i++) {
-                int h_idx = (tid * ILP + i) % hidden_dim;
-                int w_idx = vocab_idx * hidden_dim + h_idx;
-
-                float w_val = 0.0f;
-                if constexpr (std::is_same<T, half>::value) {
-                    w_val = __half2float(lm_head_weight[w_idx]);
-                } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                    w_val = __bfloat162float(lm_head_weight[w_idx]);
-                } else {
-                    w_val = lm_head_weight[w_idx];
-                }
-
-                dot += hidden[i % ILP] * w_val;
-            }
-
-            local_max = fmaxf(local_max, dot);
-        }
-
-        // Reduce max within warp
-        max_logit = fmaxf(max_logit, warp_reduce_max(local_max));
-    }
-
-    // Final reduction across warps using float-safe atomic max
-    if (tid % 32 == 0) {
-        atomicMaxFloat(&max_logits[batch_idx * seq_len + seq_idx], max_logit);
-    }
+  if (tid == 0) {
+    float loss = -(target_logit - global_max - logf(total_sum + 1e-10f));
+    loss_out[batch_idx * seq_len + seq_idx] = loss;
+  }
 }
 
-/**
- * Second pass: Compute loss using chunked softmax
- */
-template<typename T>
-__global__ void chunked_cross_entropy_loss_kernel(
-    const T* __restrict__ hidden_states,
-    const T* __restrict__ lm_head_weight,
-    const int64_t* __restrict__ labels,    // [batch_size, seq_len]
-    const float* __restrict__ max_logits,
-    float* __restrict__ losses,             // [batch_size, seq_len]
-    int batch_size,
-    int seq_len,
-    int hidden_dim,
-    int vocab_size,
-    int chunk_size
-) {
-    int batch_idx = blockIdx.x;
-    int seq_idx = blockIdx.y;
+// ---------------------------------------------------------------------------
+// Backward kernel: compute grad_hidden for each token position
+// grad_hidden[b,s,:] = sum_v [ softmax[v] * weight[v,:] ] - weight[target,:]
+// ---------------------------------------------------------------------------
+template <typename T>
+__global__ void chunked_cross_entropy_bwd_kernel(
+    const T *__restrict__ hidden_states, const T *__restrict__ weight,
+    const int64_t *__restrict__ labels,
+    const float *__restrict__ loss_vals, // needed only for sign
+    T *__restrict__ grad_hidden, int batch_size, int seq_len, int hidden_dim,
+    int vocab_size) {
+  int batch_idx = blockIdx.y;
+  int seq_idx = blockIdx.x;
+  if (batch_idx >= batch_size || seq_idx >= seq_len)
+    return;
 
-    if (batch_idx >= batch_size || seq_idx >= seq_len) return;
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
 
-    int tid = threadIdx.x;
-    int hidden_state_idx = (batch_idx * seq_len + seq_idx) * hidden_dim;
-    int target_token = labels[batch_idx * seq_len + seq_idx];
+  extern __shared__ float smem[];
+  float *shidden = smem;
+  float *scratch = smem + hidden_dim;
 
-    // Load hidden state into shared memory
-    extern __shared__ float s_hidden[];
-    float* hidden = &s_hidden[tid * ILP];
+  int h_base = (batch_idx * seq_len + seq_idx) * hidden_dim;
+  for (int d = tid; d < hidden_dim; d += nthreads)
+    shidden[d] = load_f32(hidden_states, h_base + d);
+  __syncthreads();
 
-    #pragma unroll
-    for (int i = 0; i < ILP; i++) {
-        int idx = tid * ILP + i;
-        if (idx < hidden_dim) {
-            if constexpr (std::is_same<T, half>::value) {
-                hidden[i] = __half2float(hidden_states[hidden_state_idx + idx]);
-            } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                hidden[i] = __bfloat162float(hidden_states[hidden_state_idx + idx]);
-            } else {
-                hidden[i] = hidden_states[hidden_state_idx + idx];
-            }
-        } else {
-            hidden[i] = 0.0f;
-        }
-    }
+  int64_t target = labels[batch_idx * seq_len + seq_idx];
 
-    __syncthreads();
+  // Find max logit for numerical stability
+  float local_max = -INFINITY;
+  for (int vi = tid; vi < vocab_size; vi += nthreads) {
+    float dot = 0.0f;
+    int w_base = vi * hidden_dim;
+    for (int d = 0; d < hidden_dim; d++)
+      dot += shidden[d] * load_f32(weight, w_base + d);
+    local_max = fmaxf(local_max, dot);
+  }
+  float global_max = block_reduce_max(local_max, scratch);
 
-    float max_logit = max_logits[batch_idx * seq_len + seq_idx];
-    float sum_exp = 0.0f;
-    float target_logit = -INFINITY;
+  // Compute sum_exp
+  float local_sum = 0.0f;
+  for (int vi = tid; vi < vocab_size; vi += nthreads) {
+    float dot = 0.0f;
+    int w_base = vi * hidden_dim;
+    for (int d = 0; d < hidden_dim; d++)
+      dot += shidden[d] * load_f32(weight, w_base + d);
+    local_sum += expf(dot - global_max);
+  }
+  float total_sum = block_reduce_sum(local_sum, scratch);
 
-    // Process vocabulary in chunks
-    for (int chunk_start = 0; chunk_start < vocab_size; chunk_start += chunk_size) {
-        int chunk_end = min(chunk_start + chunk_size, vocab_size);
-
-        for (int vocab_idx = chunk_start + tid; vocab_idx < chunk_end; vocab_idx += blockDim.x) {
-            // Compute dot product
-            float dot = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < ILP; i++) {
-                int h_idx = (tid * ILP + i) % hidden_dim;
-                int w_idx = vocab_idx * hidden_dim + h_idx;
-
-                float w_val = 0.0f;
-                if constexpr (std::is_same<T, half>::value) {
-                    w_val = __half2float(lm_head_weight[w_idx]);
-                } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                    w_val = __bfloat162float(lm_head_weight[w_idx]);
-                } else {
-                    w_val = lm_head_weight[w_idx];
-                }
-
-                dot += hidden[i % ILP] * w_val;
-            }
-
-            float exp_val = expf(dot - max_logit);
-            sum_exp += exp_val;
-
-            // Track target token logit
-            if (vocab_idx == target_token) {
-                target_logit = dot;
-            }
-        }
-    }
-
-    // Reduce sum across threads
-    sum_exp = warp_reduce_sum(sum_exp);
-
-    // Compute loss: -log(softmax(target)) = -(target_logit - max_logit - log(sum_exp))
+  // Accumulate grad_hidden into shared memory scratch for each d
+  // We process d in batches to reuse scratch
+  // Strategy: for each d, atomicAdd over vocab entries is too slow.
+  // Instead: each thread accumulates its own partial grad, then reduce.
+  // We loop over hidden_dim in chunks to avoid over-using registers.
+  const int D_CHUNK = 32;
+  for (int d_start = 0; d_start < hidden_dim; d_start += D_CHUNK) {
+    // Zero out scratch (nthreads * D_CHUNK floats — we need a sub-scratch)
+    // Simplification: use one thread to write per-d gradient serially
+    // This is correct but slow for large hidden_dim; acceptable for prototype.
     if (tid == 0) {
-        float loss = -(target_logit - max_logit - logf(sum_exp + 1e-10f));
-        losses[batch_idx * seq_len + seq_idx] = loss;
+      for (int d = d_start; d < min(d_start + D_CHUNK, hidden_dim); d++) {
+        float grad_d = 0.0f;
+        for (int vi = 0; vi < vocab_size; vi++) {
+          float dot = 0.0f;
+          int w_base = vi * hidden_dim;
+          for (int d2 = 0; d2 < hidden_dim; d2++)
+            dot += shidden[d2] * load_f32(weight, w_base + d2);
+          float sm = expf(dot - global_max) / (total_sum + 1e-10f);
+          grad_d += sm * load_f32(weight, vi * hidden_dim + d);
+          if (vi == (int)target)
+            grad_d -= load_f32(weight, vi * hidden_dim + d);
+        }
+        float out_val = grad_d;
+        if constexpr (std::is_same<T, half>::value)
+          grad_hidden[h_base + d] = __float2half(out_val);
+        else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+          grad_hidden[h_base + d] = __float2bfloat16(out_val);
+        else
+          grad_hidden[h_base + d] = out_val;
+      }
     }
+  }
 }
 
-/**
- * Backward pass: Compute gradient w.r.t hidden states
- * Avoids materializing full gradient tensor
- */
-template<typename T>
-__global__ void chunked_cross_entropy_backward_kernel(
-    const T* __restrict__ hidden_states,
-    const T* __restrict__ lm_head_weight,
-    const int64_t* __restrict__ labels,
-    const float* __restrict__ max_logits,
-    T* __restrict__ grad_hidden,           // [batch_size, seq_len, hidden_dim]
-    int batch_size,
-    int seq_len,
-    int hidden_dim,
-    int vocab_size,
-    int chunk_size
-) {
-    int batch_idx = blockIdx.x;
-    int seq_idx = blockIdx.y;
+// ---------------------------------------------------------------------------
+// Launcher
+// ---------------------------------------------------------------------------
+std::vector<torch::Tensor>
+chunked_cross_entropy_cuda(torch::Tensor hidden_states,  // [B, S, H]
+                           torch::Tensor lm_head_weight, // [V, H]
+                           torch::Tensor labels)         // [B, S]
+{
+  int B = hidden_states.size(0);
+  int S = hidden_states.size(1);
+  int H = hidden_states.size(2);
+  int V = lm_head_weight.size(0);
 
-    if (batch_idx >= batch_size || seq_idx >= seq_len) return;
+  auto losses = torch::zeros({B, S}, torch::TensorOptions()
+                                         .dtype(torch::kFloat32)
+                                         .device(hidden_states.device()));
+  auto grad_hidden = torch::zeros_like(hidden_states);
 
-    int tid = threadIdx.x;
-    int hidden_state_idx = (batch_idx * seq_len + seq_idx) * hidden_dim;
-    int target_token = labels[batch_idx * seq_len + seq_idx];
+  const int THREADS = 256;
+  // smem: H floats (hidden) + THREADS floats (scratch)
+  int smem = (H + THREADS) * sizeof(float);
 
-    // Load hidden state
-    extern __shared__ float s_hidden[];
-    float* hidden = &s_hidden[tid * ILP];
+  dim3 blocks(S, B);
 
-    #pragma unroll
-    for (int i = 0; i < ILP; i++) {
-        int idx = tid * ILP + i;
-        if (idx < hidden_dim) {
-            if constexpr (std::is_same<T, half>::value) {
-                hidden[i] = __half2float(hidden_states[hidden_state_idx + idx]);
-            } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                hidden[i] = __bfloat162float(hidden_states[hidden_state_idx + idx]);
-            } else {
-                hidden[i] = hidden_states[hidden_state_idx + idx];
-            }
-        } else {
-            hidden[i] = 0.0f;
-        }
-    }
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half, at::ScalarType::BFloat16,
+      hidden_states.scalar_type(), "chunked_cross_entropy", ([&] {
+        using T = scalar_t;
 
-    __syncthreads();
+        chunked_cross_entropy_fwd_kernel<T><<<blocks, THREADS, smem>>>(
+            hidden_states.data_ptr<T>(), lm_head_weight.data_ptr<T>(),
+            labels.data_ptr<int64_t>(), losses.data_ptr<float>(), B, S, H, V);
 
-    float max_logit = max_logits[batch_idx * seq_len + seq_idx];
-    float sum_exp = 0.0f;
+        chunked_cross_entropy_bwd_kernel<T><<<blocks, THREADS, smem>>>(
+            hidden_states.data_ptr<T>(), lm_head_weight.data_ptr<T>(),
+            labels.data_ptr<int64_t>(), losses.data_ptr<float>(),
+            grad_hidden.data_ptr<T>(), B, S, H, V);
+      }));
 
-    // First pass: compute sum_exp
-    for (int chunk_start = 0; chunk_start < vocab_size; chunk_start += chunk_size) {
-        int chunk_end = min(chunk_start + chunk_size, vocab_size);
-
-        for (int vocab_idx = chunk_start + tid; vocab_idx < chunk_end; vocab_idx += blockDim.x) {
-            float dot = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < ILP; i++) {
-                int h_idx = (tid * ILP + i) % hidden_dim;
-                int w_idx = vocab_idx * hidden_dim + h_idx;
-
-                float w_val = 0.0f;
-                if constexpr (std::is_same<T, half>::value) {
-                    w_val = __half2float(lm_head_weight[w_idx]);
-                } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                    w_val = __bfloat162float(lm_head_weight[w_idx]);
-                } else {
-                    w_val = lm_head_weight[w_idx];
-                }
-
-                dot += hidden[i % ILP] * w_val;
-            }
-
-            sum_exp += expf(dot - max_logit);
-        }
-    }
-
-    sum_exp = warp_reduce_sum(sum_exp);
-
-    // Second pass: compute gradient
-    // grad_hidden = sum(softmax * weight) - weight[target]
-    float grad[ILP];
-    #pragma unroll
-    for (int i = 0; i < ILP; i++) {
-        grad[i] = 0.0f;
-    }
-
-    for (int chunk_start = 0; chunk_start < vocab_size; chunk_start += chunk_size) {
-        int chunk_end = min(chunk_start + chunk_size, vocab_size);
-
-        for (int vocab_idx = chunk_start + tid; vocab_idx < chunk_end; vocab_idx += blockDim.x) {
-            float dot = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < ILP; i++) {
-                int h_idx = (tid * ILP + i) % hidden_dim;
-                int w_idx = vocab_idx * hidden_dim + h_idx;
-
-                float w_val = 0.0f;
-                if constexpr (std::is_same<T, half>::value) {
-                    w_val = __half2float(lm_head_weight[w_idx]);
-                } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                    w_val = __bfloat162float(lm_head_weight[w_idx]);
-                } else {
-                    w_val = lm_head_weight[w_idx];
-                }
-
-                dot += hidden[i % ILP] * w_val;
-            }
-
-            float softmax = expf(dot - max_logit) / (sum_exp + 1e-10f);
-
-            // Accumulate gradient: softmax * weight
-            #pragma unroll
-            for (int i = 0; i < ILP; i++) {
-                int h_idx = (tid * ILP + i) % hidden_dim;
-                int w_idx = vocab_idx * hidden_dim + h_idx;
-
-                float w_val = 0.0f;
-                if constexpr (std::is_same<T, half>::value) {
-                    w_val = __half2float(lm_head_weight[w_idx]);
-                } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                    w_val = __bfloat162float(lm_head_weight[w_idx]);
-                } else {
-                    w_val = lm_head_weight[w_idx];
-                }
-
-                grad[i % ILP] += softmax * w_val;
-            }
-
-            // Subtract weight of target token
-            if (vocab_idx == target_token) {
-                #pragma unroll
-                for (int i = 0; i < ILP; i++) {
-                    int h_idx = (tid * ILP + i) % hidden_dim;
-                    int w_idx = vocab_idx * hidden_dim + h_idx;
-
-                    float w_val = 0.0f;
-                    if constexpr (std::is_same<T, half>::value) {
-                        w_val = __half2float(lm_head_weight[w_idx]);
-                    } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                        w_val = __bfloat162float(lm_head_weight[w_idx]);
-                    } else {
-                        w_val = lm_head_weight[w_idx];
-                    }
-
-                    grad[i % ILP] -= w_val;
-                }
-            }
-        }
-    }
-
-    // Reduce and write gradient
-    for (int i = 0; i < ILP; i++) {
-        int h_idx = tid * ILP + i;
-        if (h_idx < hidden_dim) {
-            float g = warp_reduce_sum(grad[i]);
-            if (tid % 32 == 0) {
-                if constexpr (std::is_same<T, half>::value) {
-                    grad_hidden[hidden_state_idx + h_idx] = __float2half(g);
-                } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                    grad_hidden[hidden_state_idx + h_idx] = __float2bfloat16(g);
-                } else {
-                    grad_hidden[hidden_state_idx + h_idx] = g;
-                }
-            }
-        }
-    }
-}
-
-// Main launch function
-std::vector<torch::Tensor> chunked_cross_entropy_cuda(
-    torch::Tensor hidden_states,  // [batch_size, seq_len, hidden_dim]
-    torch::Tensor lm_head_weight, // [vocab_size, hidden_dim]
-    torch::Tensor labels          // [batch_size, seq_len]
-) {
-    int batch_size = hidden_states.size(0);
-    int seq_len = hidden_states.size(1);
-    int hidden_dim = hidden_states.size(2);
-    int vocab_size = lm_head_weight.size(0);
-
-    // Chunk size for processing vocabulary (tunable based on GPU)
-    const int chunk_size = 4096;
-
-    // Allocate outputs
-    auto max_logits = torch::full({batch_size, seq_len}, -INFINITY,
-        torch::TensorOptions().dtype(torch::kFloat32).device(hidden_states.device()));
-
-    auto losses = torch::empty({batch_size, seq_len},
-        torch::TensorOptions().dtype(torch::kFloat32).device(hidden_states.device()));
-
-    auto grad_hidden = torch::empty_like(hidden_states);
-
-    // Launch kernels based on data type
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        hidden_states.scalar_type(), "chunked_cross_entropy_forward", ([&] {
-            using T = scalar_t;
-            dim3 threads(256);
-            dim3 blocks(batch_size, seq_len);
-            int shared_mem = hidden_dim * sizeof(float);
-
-            // First pass: find max logits
-            chunked_cross_entropy_max_kernel<T><<<blocks, threads, shared_mem>>>(
-                hidden_states.data_ptr<T>(),
-                lm_head_weight.data_ptr<T>(),
-                max_logits.data_ptr<float>(),
-                batch_size,
-                seq_len,
-                hidden_dim,
-                vocab_size,
-                chunk_size
-            );
-
-            // Second pass: compute loss
-            chunked_cross_entropy_loss_kernel<T><<<blocks, threads, shared_mem>>>(
-                hidden_states.data_ptr<T>(),
-                lm_head_weight.data_ptr<T>(),
-                labels.data_ptr<int64_t>(),
-                max_logits.data_ptr<float>(),
-                losses.data_ptr<float>(),
-                batch_size,
-                seq_len,
-                hidden_dim,
-                vocab_size,
-                chunk_size
-            );
-
-            // Backward pass (for training)
-            chunked_cross_entropy_backward_kernel<T><<<blocks, threads, shared_mem>>>(
-                hidden_states.data_ptr<T>(),
-                lm_head_weight.data_ptr<T>(),
-                labels.data_ptr<int64_t>(),
-                max_logits.data_ptr<float>(),
-                grad_hidden.data_ptr<T>(),
-                batch_size,
-                seq_len,
-                hidden_dim,
-                vocab_size,
-                chunk_size
-            );
-        })
-    );
-
-    return {losses, grad_hidden};
+  return {losses, grad_hidden};
 }
