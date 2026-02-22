@@ -11,7 +11,14 @@ import sys
 from pathlib import Path
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+try:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+    _TORCH_AVAILABLE = True
+except ImportError:
+    BuildExtension = None
+    CUDAExtension = None
+    _TORCH_AVAILABLE = False
 
 # Project metadata
 PROJECT_NAME = "barqtrain"
@@ -22,8 +29,9 @@ LONG_DESCRIPTION = (Path(__file__).parent / "README.md").read_text(encoding="utf
 
 def build_cuda_extension():
     """Build the CUDA C++ extension if CUDA is available."""
+    if not _TORCH_AVAILABLE:
+        return None
     try:
-        import torch
         from torch.utils.cpp_extension import CUDA_HOME
 
         if CUDA_HOME is None and not os.path.exists("csrc"):
@@ -153,7 +161,7 @@ setup(
         ],
     },
     ext_modules=[ext for ext in [build_cuda_extension()] if ext is not None],
-    cmdclass={"build_ext": BuildExtension} if build_cuda_extension() else {},
+    cmdclass={"build_ext": BuildExtension} if (build_cuda_extension() and BuildExtension) else {},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
