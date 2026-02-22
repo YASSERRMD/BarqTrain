@@ -6,6 +6,40 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_ARCHITECTURES "native")  # Detect from system
 set(CMAKE_BUILD_TYPE Release)
 
+# ---------------------------------------------------------------------------
+# Auto-detect PyTorch's CMake prefix from the active Python environment.
+# This avoids having to manually set CMAKE_PREFIX_PATH or Torch_DIR.
+# Users can still override by passing -DCMAKE_PREFIX_PATH=... to cmake.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED Torch_DIR)
+    find_program(PYTHON_EXEC NAMES python3 python)
+    if(PYTHON_EXEC)
+        execute_process(
+            COMMAND ${PYTHON_EXEC} -c
+                "import torch; print(torch.utils.cmake_prefix_path)"
+            OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE TORCH_QUERY_RESULT
+        )
+        if(TORCH_QUERY_RESULT EQUAL 0 AND TORCH_CMAKE_PREFIX)
+            message(STATUS "Auto-detected PyTorch cmake prefix: ${TORCH_CMAKE_PREFIX}")
+            list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX}")
+        else()
+            message(FATAL_ERROR
+                "Could not determine PyTorch cmake prefix automatically.\n"
+                "Please set it manually:\n"
+                "  cmake -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)') .."
+            )
+        endif()
+    else()
+        message(FATAL_ERROR
+            "Python not found. Install Python and PyTorch, then re-run cmake.\n"
+            "Or pass the torch cmake prefix directly:\n"
+            "  cmake -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)') .."
+        )
+    endif()
+endif()
+
 # Find PyTorch and CUDA
 find_package(Torch REQUIRED)
 find_package(CUDA REQUIRED)
