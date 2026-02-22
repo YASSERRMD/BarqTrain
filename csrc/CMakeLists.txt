@@ -8,8 +8,6 @@ set(CMAKE_BUILD_TYPE Release)
 
 # ---------------------------------------------------------------------------
 # Auto-detect PyTorch's CMake prefix from the active Python environment.
-# This avoids having to manually set CMAKE_PREFIX_PATH or Torch_DIR.
-# Users can still override by passing -DCMAKE_PREFIX_PATH=... to cmake.
 # ---------------------------------------------------------------------------
 if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED Torch_DIR)
     find_program(PYTHON_EXEC NAMES python3 python)
@@ -32,13 +30,17 @@ if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED Torch_DIR)
             )
         endif()
     else()
-        message(FATAL_ERROR
-            "Python not found. Install Python and PyTorch, then re-run cmake.\n"
-            "Or pass the torch cmake prefix directly:\n"
-            "  cmake -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)') .."
-        )
+        message(FATAL_ERROR "Python not found. Install Python and PyTorch first.")
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# Find Python development headers (provides Python.h)
+# On Colab/Debian: apt-get install -y python3-dev
+# ---------------------------------------------------------------------------
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+message(STATUS "Python3 include dirs: ${Python3_INCLUDE_DIRS}")
+message(STATUS "Python3 libraries:    ${Python3_LIBRARIES}")
 
 # Find PyTorch and CUDA
 find_package(Torch REQUIRED)
@@ -49,6 +51,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${TORCH_INCLUDE_DIRS}
     ${CUDA_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}      # <-- provides Python.h
 )
 
 # Source files
@@ -68,6 +71,7 @@ target_link_libraries(${PROJECT_NAME}
     ${TORCH_LIBRARIES}
     ${CUDA_LIBRARIES}
     ${CUDA_CUBLAS_LIBRARIES}
+    Python3::Python              # <-- links libpython
 )
 
 # Set output properties
