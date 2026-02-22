@@ -1,301 +1,189 @@
 /**
  * BarqTrain FlashAttention Kernel with Fused RoPE
  *
- * Implements FlashAttention-2 style kernel with Rotary Positional
- * Embeddings fused directly into the Q/K computation phase.
+ * Correctness-focused implementation.
  *
- * Key optimizations:
- * 1. Tiled attention computation to avoid materializing [N^2] attention matrix
- * 2. Online softmax to reduce memory usage
- * 3. Fused RoPE rotation during Q/K load
- * 4. Shared memory tiling for Q, K, V matrices
+ * Key fixes vs original:
+ *  1. RoPE cos/sin cache is computed on CPU tensors then .to(device) —
+ *     the original called a CPU function to write to a GPU pointer (UB/crash).
+ *  2. Online softmax is correctly implemented (running max + rescale).
+ *  3. Shared memory sized correctly (< 32 KB for sm_75 compatibility).
+ *  4. No VLA or out-of-bounds register arrays.
  *
- * Note: This is a simplified implementation. Production FlashAttention-3
- * uses more advanced techniques like HBM access quantization and
- * sequence-level parallelism.
+ * Design:
+ *  - One block per (batch, head, q_tile) — blockDim.x = BLOCK_M threads
+ *  - Each thread handles one query position
+ *  - KV positions processed sequentially (causal mask enforced)
+ *  - d_head must be <= MAX_D_HEAD (compile-time constant)
  */
 
-#include <torch/extension.h>
-#include <cuda_runtime.h>
+#include <cmath>
 #include <cuda_fp16.h>
-#include <vector>
-#include <math.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
 
-#define BLOCK_M 64   // Block size for Q dimension
-#define BLOCK_N 64   // Block size for K,V dimension
-#define BLOCK_DMODEL 64  // Block size for head dimension
+// Max supported head dimension (increase if needed, uses register space)
+#define MAX_D_HEAD 128
+#define BLOCK_M 32 // threads per block = queries per block
 
-// RoPE rotation in complex plane
-__device__ __forceinline__ void apply_rope(
-    float& x_real,
-    float& x_imag,
-    float cos,
-    float sin
-) {
-    float new_real = x_real * cos - x_imag * sin;
-    float new_imag = x_real * sin + x_imag * cos;
-    x_real = new_real;
-    x_imag = new_imag;
+// ---------------------------------------------------------------------------
+// Helper: load as float
+// ---------------------------------------------------------------------------
+template <typename T>
+__device__ __forceinline__ float load_f32(const T *ptr, int idx) {
+  if constexpr (std::is_same<T, half>::value)
+    return __half2float(ptr[idx]);
+  else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+    return __bfloat162float(ptr[idx]);
+  else
+    return ptr[idx];
 }
 
-// FlashAttention forward kernel with fused RoPE
-template<typename T>
-__global__ void flash_attention_forward_kernel(
-    const T* __restrict__ q,  // [batch, n_heads, seq_len, d_head]
-    const T* __restrict__ k,  // [batch, n_heads, seq_len, d_head]
-    const T* __restrict__ v,  // [batch, n_heads, seq_len, d_head]
-    T* __restrict__ output,   // [batch, n_heads, seq_len, d_head]
-    const float* __restrict__ cos_cache,  // [max_seq_len, d_head/2]
-    const float* __restrict__ sin_cache,  // [max_seq_len, d_head/2]
-    int batch_size,
-    int n_heads,
-    int seq_len,
-    int d_head,
-    float scale
-) {
-    // Batch and head
-    int batch_idx = blockIdx.z;
-    int head_idx = blockIdx.y;
-
-    if (batch_idx >= batch_size || head_idx >= n_heads) return;
-
-    // Sequence position (Q)
-    int q_idx = blockIdx.x * BLOCK_M + threadIdx.x;
-
-    if (q_idx >= seq_len) return;
-
-    // Shared memory for Q, K, V tiles
-    extern __shared__ float smem[];
-    float* Q_tile = &smem[0];
-    float* K_tile = &smem[BLOCK_M * BLOCK_DMODEL];
-    float* V_tile = &smem[BLOCK_M * BLOCK_DMODEL + BLOCK_N * BLOCK_DMODEL];
-
-    // Load Q with RoPE applied
-    int q_base = ((batch_idx * n_heads + head_idx) * seq_len + q_idx) * d_head;
-
-    for (int d = threadIdx.y; d < d_head; d += blockDim.y) {
-        float q_val = 0.0f;
-        if (q_idx < seq_len && d < d_head) {
-            if constexpr (std::is_same<T, half>::value) {
-                q_val = __half2float(q[q_base + d]);
-            } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                q_val = __bfloat162float(q[q_base + d]);
-            } else {
-                q_val = q[q_base + d];
-            }
-        }
-
-        // Apply RoPE (interleave pairs)
-        int half_d = d / 2;
-        int pair_idx = d % 2;
-
-        if (pair_idx == 1 && q_idx < seq_len && d < d_head) {
-            int d_real = d - 1;
-            int d_imag = d;
-
-            float q_real = Q_tile[threadIdx.x * BLOCK_DMODEL + d_real];
-            float q_imag = q_val;
-
-            float cos_val = cos_cache[q_idx * half_d + d_real / 2];
-            float sin_val = sin_cache[q_idx * half_d + d_real / 2];
-
-            apply_rope(q_real, q_imag, cos_val, sin_val);
-
-            Q_tile[threadIdx.x * BLOCK_DMODEL + d_real] = q_real;
-            Q_tile[threadIdx.x * BLOCK_DMODEL + d_imag] = q_imag;
-        } else if (pair_idx == 0) {
-            Q_tile[threadIdx.x * BLOCK_DMODEL + d] = q_val;
-        }
-    }
-
-    __syncthreads();
-
-    // Accumulate attention output
-    float acc[BLOCK_DMODEL] = {0.0f};
-    float softmax_sum = 0.0f;
-
-    // Process K,V in blocks
-    for (int kv_block = 0; kv_block < (seq_len + BLOCK_N - 1) / BLOCK_N; kv_block++) {
-        // Load K tile with RoPE
-        for (int k_idx = threadIdx.x; k_idx < BLOCK_N; k_idx += blockDim.x) {
-            int global_k_idx = kv_block * BLOCK_N + k_idx;
-            if (global_k_idx < seq_len) {
-                for (int d = threadIdx.y; d < d_head; d += blockDim.y) {
-                    float k_val = 0.0f;
-                    int k_base = ((batch_idx * n_heads + head_idx) * seq_len + global_k_idx) * d_head;
-
-                    if constexpr (std::is_same<T, half>::value) {
-                        k_val = __half2float(k[k_base + d]);
-                    } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                        k_val = __bfloat162float(k[k_base + d]);
-                    } else {
-                        k_val = k[k_base + d];
-                    }
-
-                    // Apply RoPE
-                    int half_d = d / 2;
-                    int pair_idx = d % 2;
-
-                    if (pair_idx == 1 && d < d_head) {
-                        int d_real = d - 1;
-                        float k_real = K_tile[k_idx * BLOCK_DMODEL + d_real];
-                        float k_imag = k_val;
-
-                        float cos_val = cos_cache[global_k_idx * half_d + d_real / 2];
-                        float sin_val = sin_cache[global_k_idx * half_d + d_real / 2];
-
-                        apply_rope(k_real, k_imag, cos_val, sin_val);
-
-                        K_tile[k_idx * BLOCK_DMODEL + d_real] = k_real;
-                        K_tile[k_idx * BLOCK_DMODEL + d] = k_imag;
-                    } else if (pair_idx == 0) {
-                        K_tile[k_idx * BLOCK_DMODEL + d] = k_val;
-                    }
-                }
-            }
-        }
-
-        // Load V tile
-        for (int k_idx = threadIdx.x; k_idx < BLOCK_N; k_idx += blockDim.x) {
-            int global_k_idx = kv_block * BLOCK_N + k_idx;
-            if (global_k_idx < seq_len) {
-                for (int d = threadIdx.y; d < d_head; d += blockDim.y) {
-                    int v_base = ((batch_idx * n_heads + head_idx) * seq_len + global_k_idx) * d_head;
-
-                    if constexpr (std::is_same<T, half>::value) {
-                        V_tile[k_idx * BLOCK_DMODEL + d] = __half2float(v[v_base + d]);
-                    } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                        V_tile[k_idx * BLOCK_DMODEL + d] = __bfloat162float(v[v_base + d]);
-                    } else {
-                        V_tile[k_idx * BLOCK_DMODEL + d] = v[v_base + d];
-                    }
-                }
-            }
-        }
-
-        __syncthreads();
-
-        // Compute attention scores and accumulate
-        for (int k_idx = 0; k_idx < BLOCK_N && kv_block * BLOCK_N + k_idx < seq_len; k_idx++) {
-            float score = 0.0f;
-
-            // Dot product Q @ K^T
-            for (int d = 0; d < d_head; d++) {
-                score += Q_tile[threadIdx.x * BLOCK_DMODEL + d] * K_tile[k_idx * BLOCK_DMODEL + d];
-            }
-
-            score *= scale;  // Apply scaling factor
-
-            // Causal masking: only attend to current and previous positions
-            if (kv_block * BLOCK_N + k_idx > q_idx) {
-                score = -INFINITY;
-            }
-
-            // Online softmax
-            float max_score = fmaxf(score, 0.0f);  // Simplified
-            float exp_score = expf(score - max_score);
-
-            float new_sum = softmax_sum + exp_score;
-
-            // Update running accumulator
-            for (int d = 0; d < d_head; d++) {
-                acc[d] = acc[d] * (softmax_sum / new_sum) + exp_score * V_tile[k_idx * BLOCK_DMODEL + d] / new_sum;
-            }
-
-            softmax_sum = new_sum;
-        }
-
-        __syncthreads();
-    }
-
-    // Write output
-    if (q_idx < seq_len) {
-        int out_base = ((batch_idx * n_heads + head_idx) * seq_len + q_idx) * d_head;
-        for (int d = threadIdx.y; d < d_head; d += blockDim.y) {
-            if constexpr (std::is_same<T, half>::value) {
-                output[out_base + d] = __float2half(acc[d]);
-            } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-                output[out_base + d] = __float2bfloat16(acc[d]);
-            } else {
-                output[out_base + d] = acc[d];
-            }
-        }
-    }
+// ---------------------------------------------------------------------------
+// Helper: store float as T
+// ---------------------------------------------------------------------------
+template <typename T>
+__device__ __forceinline__ void store_f32(T *ptr, int idx, float val) {
+  if constexpr (std::is_same<T, half>::value)
+    ptr[idx] = __float2half(val);
+  else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+    ptr[idx] = __float2bfloat16(val);
+  else
+    ptr[idx] = val;
 }
 
-// Helper function to compute RoPE cos/sin cache
-void compute_rope_cache(
-    float* cos_cache,
-    float* sin_cache,
-    int max_seq_len,
-    int d_head,
-    float theta
-) {
-    for (int pos = 0; pos < max_seq_len; pos++) {
-        for (int i = 0; i < d_head / 2; i++) {
-            float freq = powf(theta, -2.0f * i / d_head);
-            cos_cache[pos * (d_head / 2) + i] = cosf(pos * freq);
-            sin_cache[pos * (d_head / 2) + i] = sinf(pos * freq);
-        }
+// ---------------------------------------------------------------------------
+// FlashAttention forward kernel
+//  grid:  (ceil(seq_len/BLOCK_M), n_heads, batch_size)
+//  block: (BLOCK_M, 1, 1)
+// ---------------------------------------------------------------------------
+template <typename T>
+__global__ void
+flash_attention_forward_kernel(const T *__restrict__ q, // [B, H, S, D]
+                               const T *__restrict__ k, // [B, H, S, D]
+                               const T *__restrict__ v, // [B, H, S, D]
+                               T *__restrict__ output,  // [B, H, S, D]
+                               const float *__restrict__ cos_cache, // [S, D/2]
+                               const float *__restrict__ sin_cache, // [S, D/2]
+                               int batch_size, int n_heads, int seq_len,
+                               int d_head, float scale) {
+  int batch_idx = blockIdx.z;
+  int head_idx = blockIdx.y;
+  int q_pos = blockIdx.x * BLOCK_M + threadIdx.x;
+
+  if (batch_idx >= batch_size || head_idx >= n_heads || q_pos >= seq_len)
+    return;
+
+  // ---- Load Q and apply RoPE ----
+  float q_vec[MAX_D_HEAD];
+  int q_base = ((batch_idx * n_heads + head_idx) * seq_len + q_pos) * d_head;
+  for (int d = 0; d < d_head; d++)
+    q_vec[d] = load_f32(q, q_base + d);
+
+  // RoPE on Q: rotate pairs (d, d+1) by (cos, sin) at position q_pos
+  for (int d = 0; d + 1 < d_head; d += 2) {
+    float c = cos_cache[q_pos * (d_head / 2) + d / 2];
+    float s = sin_cache[q_pos * (d_head / 2) + d / 2];
+    float r = q_vec[d], i = q_vec[d + 1];
+    q_vec[d] = r * c - i * s;
+    q_vec[d + 1] = r * s + i * c;
+  }
+
+  // ---- Online softmax attention (causal) ----
+  float acc[MAX_D_HEAD] = {};
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+
+  for (int kv_pos = 0; kv_pos <= q_pos; kv_pos++) {
+    int kv_base =
+        ((batch_idx * n_heads + head_idx) * seq_len + kv_pos) * d_head;
+
+    // Load K and apply RoPE
+    float k_vec[MAX_D_HEAD];
+    for (int d = 0; d < d_head; d++)
+      k_vec[d] = load_f32(k, kv_base + d);
+    for (int d = 0; d + 1 < d_head; d += 2) {
+      float c = cos_cache[kv_pos * (d_head / 2) + d / 2];
+      float s = sin_cache[kv_pos * (d_head / 2) + d / 2];
+      float r = k_vec[d], ii = k_vec[d + 1];
+      k_vec[d] = r * c - ii * s;
+      k_vec[d + 1] = r * s + ii * c;
     }
+
+    // Attention score: Q · K * scale
+    float score = 0.0f;
+    for (int d = 0; d < d_head; d++)
+      score += q_vec[d] * k_vec[d];
+    score *= scale;
+
+    // Online softmax update (numerically stable)
+    float new_max = fmaxf(running_max, score);
+    float exp_s = expf(score - new_max);
+    float rescale = expf(running_max - new_max);
+
+    // Load V and accumulate
+    for (int d = 0; d < d_head; d++) {
+      float v_val = load_f32(v, kv_base + d);
+      acc[d] = acc[d] * rescale + exp_s * v_val;
+    }
+
+    running_sum = running_sum * rescale + exp_s;
+    running_max = new_max;
+  }
+
+  // ---- Write normalised output ----
+  int out_base = ((batch_idx * n_heads + head_idx) * seq_len + q_pos) * d_head;
+  for (int d = 0; d < d_head; d++)
+    store_f32(output, out_base + d, acc[d] / (running_sum + 1e-10f));
 }
 
-// Main launcher for FlashAttention with fused RoPE
-torch::Tensor flash_attention_cuda(
-    torch::Tensor q,  // [batch, n_heads, seq_len, d_head]
-    torch::Tensor k,  // [batch, n_heads, seq_len, d_head]
-    torch::Tensor v   // [batch, n_heads, seq_len, d_head]
-) {
-    int batch_size = q.size(0);
-    int n_heads = q.size(1);
-    int seq_len = q.size(2);
-    int d_head = q.size(3);
+// ---------------------------------------------------------------------------
+// Launcher
+// ---------------------------------------------------------------------------
+torch::Tensor flash_attention_cuda(torch::Tensor q, // [B, H, S, D]
+                                   torch::Tensor k, torch::Tensor v) {
+  int B = q.size(0);
+  int H = q.size(1);
+  int S = q.size(2);
+  int D = q.size(3);
 
-    // Allocate output
-    auto output = torch::empty_like(q);
+  TORCH_CHECK(D <= MAX_D_HEAD, "flash_attention_cuda: d_head (", D,
+              ") > MAX_D_HEAD (", MAX_D_HEAD, ")");
 
-    // Compute RoPE cache (in practice, precompute this)
-    auto cos_cache = torch::empty({seq_len, d_head / 2},
-        torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-    auto sin_cache = torch::empty({seq_len, d_head / 2},
-        torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+  auto output = torch::empty_like(q);
 
-    compute_rope_cache(
-        cos_cache.data_ptr<float>(),
-        sin_cache.data_ptr<float>(),
-        seq_len,
-        d_head,
-        10000.0f  // theta base
-    );
+  // Compute RoPE cache on CPU, then move to device.
+  // (Original code wrote to a GPU pointer from CPU which is undefined
+  // behaviour.)
+  auto cos_cpu = torch::zeros({S, D / 2}, torch::kFloat32);
+  auto sin_cpu = torch::zeros({S, D / 2}, torch::kFloat32);
+  auto *cos_ptr = cos_cpu.data_ptr<float>();
+  auto *sin_ptr = sin_cpu.data_ptr<float>();
+  const float theta = 10000.0f;
+  for (int pos = 0; pos < S; pos++) {
+    for (int i = 0; i < D / 2; i++) {
+      float freq = powf(theta, -2.0f * i / (float)D);
+      cos_ptr[pos * (D / 2) + i] = cosf(pos * freq);
+      sin_ptr[pos * (D / 2) + i] = sinf(pos * freq);
+    }
+  }
+  auto cos_cache = cos_cpu.to(q.device());
+  auto sin_cache = sin_cpu.to(q.device());
 
-    // Scaling factor for attention scores
-    float scale = 1.0f / sqrtf(float(d_head));
+  float scale = 1.0f / sqrtf((float)D);
 
-    // Launch kernel
-    dim3 blocks((seq_len + BLOCK_M - 1) / BLOCK_M, n_heads, batch_size);
-    dim3 threads(BLOCK_M, BLOCK_DMODEL / BLOCK_M);  // Adjust based on d_head
+  dim3 blocks((S + BLOCK_M - 1) / BLOCK_M, H, B);
+  dim3 threads(BLOCK_M);
 
-    int shared_mem = 3 * BLOCK_M * BLOCK_DMODEL * sizeof(float);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half, at::ScalarType::BFloat16, q.scalar_type(),
+      "flash_attention_forward", ([&] {
+        using T = scalar_t;
+        flash_attention_forward_kernel<T><<<blocks, threads>>>(
+            q.data_ptr<T>(), k.data_ptr<T>(), v.data_ptr<T>(),
+            output.data_ptr<T>(), cos_cache.data_ptr<float>(),
+            sin_cache.data_ptr<float>(), B, H, S, D, scale);
+      }));
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        q.scalar_type(), "flash_attention_forward", ([&] {
-            using T = scalar_t;
-            flash_attention_forward_kernel<T><<<blocks, threads, shared_mem>>>(
-                q.data_ptr<T>(),
-                k.data_ptr<T>(),
-                v.data_ptr<T>(),
-                output.data_ptr<T>(),
-                cos_cache.data_ptr<float>(),
-                sin_cache.data_ptr<float>(),
-                batch_size,
-                n_heads,
-                seq_len,
-                d_head,
-                scale
-            );
-        })
-    );
-
-    return output;
+  return output;
 }
