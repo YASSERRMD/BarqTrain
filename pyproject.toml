@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "maturin>=1.0", "ninja", "cmake>=3.20", "torch"]
+requires = ["setuptools>=61.0", "wheel", "torch"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -54,26 +54,26 @@ benchmark = [
     "psutil>=5.9.0",
     "wandb>=0.15.0",
 ]
+cuda = [
+    "ninja",
+    "cmake>=3.20",
+]
+rust = [
+    "maturin>=1.0",
+]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/barqtrain"
-Repository = "https://github.com/yourusername/barqtrain"
-Issues = "https://github.com/yourusername/barqtrain/issues"
+Homepage = "https://github.com/YASSERRMD/BarqTrain"
+Repository = "https://github.com/YASSERRMD/BarqTrain"
+Issues = "https://github.com/YASSERRMD/BarqTrain/issues"
 
 [tool.setuptools]
-package-dir = {"" = "."}
+package-dir = {"" = "python"}
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["python"]
 include = ["barqtrain*"]
-exclude = ["tests*", "benchmarks*", "rust*", "csrc*"]
-
-[tool.setuptools.ext-modules]
-# CUDA C++ extension will be built via custom CMake logic
-
-[tool.maturin]
-python-source = "python"
-module-name = "barqtrain._rust"
+exclude = ["tests*", "benchmarks*"]
 
 [tool.black]
 line-length = 100
