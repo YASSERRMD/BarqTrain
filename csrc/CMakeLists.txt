@@ -61,8 +61,9 @@ endif()
 # Compile for exactly one architecture — 3-5x faster than 'native' multi-arch
 set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCH}")
 
-# Speed up nvcc: parallel threads during early compilation phases
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --threads 4")
+# -O2 and no --threads: reduces peak compile RAM on Colab (~12 GB limit).
+# --threads 4 saves wall-clock time but each thread uses 1-2 GB → OOM-killed.
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O2 --use_fast_math")
 set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS}  -O3")
 
 # ---------------------------------------------------------------------------

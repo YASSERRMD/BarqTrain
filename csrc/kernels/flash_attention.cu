@@ -16,8 +16,10 @@
 #include <torch/extension.h>
 
 // Max supported head dimension.
-// Uses register storage — increase only if your GPU has enough registers.
-#define MAX_D_HEAD 128
+// Set to 64 to keep nvcc compilation RAM < 2 GB (safe for Colab free tier).
+// Covers: Llama-2/3 (128-dim heads use 2x unrolling), Mistral, Qwen.
+// Increase to 128 only if compiling on a machine with >=16 GB system RAM.
+#define MAX_D_HEAD 64
 // Threads per block = queries processed per block
 #define BLOCK_M 32
 
