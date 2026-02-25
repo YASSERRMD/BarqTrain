@@ -23,20 +23,23 @@ BarqTrain works out of the box on Colab's GPU runtimes — no manual setup neede
 **Step 2 — Clone & install**
 
 ```python
-# Cell 1 – clone and install (run this every time you open a new Colab session)
+# Cell 1 – clone, install, and verify (run once per Colab session)
 !git clone -b test https://github.com/YASSERRMD/BarqTrain.git
 %cd BarqTrain
-# pip install -e . registers the package so 'import barqtrain' works
 !pip install -e . -q
 
-# Verify the import works
+# Colab doesn't always reload .pth files in a running session —
+# this sys.path line makes the import work immediately.
+import sys, importlib
+sys.path.insert(0, '/content/BarqTrain/python')
+importlib.invalidate_caches()
+
 import barqtrain
 from barqtrain import patch_model
 print(f"BarqTrain {barqtrain.__version__} loaded ✓")
 ```
 
-> **⚠️ Important:** If you do `git pull` later to get updates, re-run
-> `pip install -e .` so the package metadata stays in sync.
+> **⚠️ Note:** If you restart the Colab runtime, just re-run this cell.
 
 **Step 3 — (Optional) Compile CUDA kernels for maximum performance**
 
@@ -62,32 +65,52 @@ print("CUDA extension loaded ✓")
 
 ```python
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer,
+    Trainer, TrainingArguments,
+    DataCollatorForLanguageModeling,
+)
 from datasets import load_dataset
 from barqtrain import patch_model
 
 # Load model (bfloat16 to fit in Colab VRAM)
 model_id = "meta-llama/Meta-Llama-3-8B"   # swap for any HF model
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Causal LMs need a pad token; use EOS if not set
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
-    device_map="auto",          # auto-places on the Colab GPU
+    device_map="auto",
 )
-tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 # Apply BarqTrain fused kernels (RMSNorm, FlashAttention, chunked CE)
 patch_model(model)
 print("BarqTrain patches applied ✓")
 
-# Load dataset
+# Load and tokenize dataset
 dataset = load_dataset("tatsu-lab/alpaca", split="train[:1000]")
 
 def tokenize(example):
-    return tokenizer(
-        example["text"], truncation=True, max_length=512, padding="max_length"
+    out = tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=512,
+        padding="max_length",
     )
+    # labels must be provided — for causal LM they equal input_ids.
+    # DataCollatorForLanguageModeling will shift them internally.
+    out["labels"] = out["input_ids"].copy()
+    return out
 
 tokenized = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+tokenized.set_format("torch")
+
+# DataCollator for causal LM — sets padding positions in labels to -100
+# so they are ignored in the loss, and shifts labels by one position.
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 # Train
 args = TrainingArguments(
@@ -95,12 +118,17 @@ args = TrainingArguments(
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
     num_train_epochs=1,
-    bf16=True,                  # use bfloat16 on Colab A100/L4/T4
+    bf16=True,
     logging_steps=10,
     save_strategy="epoch",
 )
 
-trainer = Trainer(model=model, args=args, train_dataset=tokenized)
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=tokenized,
+    data_collator=data_collator,
+)
 trainer.train()
 ```
 
