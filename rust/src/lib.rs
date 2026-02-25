@@ -4,9 +4,7 @@
 //! for efficient LLM fine-tuning.
 
 use pyo3::prelude::*;
-use pyo3::types::PyList;
 use rayon::prelude::*;
-use std::collections::HashMap;
 
 /// Packed batch containing concatenated sequences with metadata
 #[pyclass]
@@ -140,7 +138,7 @@ fn pack_sequences(sequences: Vec<Vec<u32>>, max_len: usize) -> PyResult<Vec<Pack
 /// Returns:
 ///     Tokenized sequences (placeholder implementation)
 #[pyfunction]
-fn parallel_tokenize(texts: Vec<String>, tokenizer_path: String) -> PyResult<Vec<Vec<u32>>> {
+fn parallel_tokenize(texts: Vec<String>, _tokenizer_path: String) -> PyResult<Vec<Vec<u32>>> {
     // Parallel processing with Rayon
     let tokenized: Vec<Vec<u32>> = texts
         .par_iter()
