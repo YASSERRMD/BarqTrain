@@ -23,20 +23,23 @@ BarqTrain works out of the box on Colab's GPU runtimes — no manual setup neede
 **Step 2 — Clone & install**
 
 ```python
-# Cell 1 – clone and install (run this every time you open a new Colab session)
+# Cell 1 – clone, install, and verify (run once per Colab session)
 !git clone -b test https://github.com/YASSERRMD/BarqTrain.git
 %cd BarqTrain
-# pip install -e . registers the package so 'import barqtrain' works
 !pip install -e . -q
 
-# Verify the import works
+# Colab doesn't always reload .pth files in a running session —
+# this sys.path line makes the import work immediately.
+import sys, importlib
+sys.path.insert(0, '/content/BarqTrain/python')
+importlib.invalidate_caches()
+
 import barqtrain
 from barqtrain import patch_model
 print(f"BarqTrain {barqtrain.__version__} loaded ✓")
 ```
 
-> **⚠️ Important:** If you do `git pull` later to get updates, re-run
-> `pip install -e .` so the package metadata stays in sync.
+> **⚠️ Note:** If you restart the Colab runtime, just re-run this cell.
 
 **Step 3 — (Optional) Compile CUDA kernels for maximum performance**
 
