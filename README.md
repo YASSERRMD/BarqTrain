@@ -240,7 +240,7 @@ barqtrain/
 ## Supported Models
 
 - Llama (1, 2, 3) - Full support
-- Qwen/Qwen2 - Full support
+- Qwen family (Qwen2, Qwen2-MoE, Qwen3) - RMSNorm fused patch support
 - Google Gemma family (Gemma, Gemma2, Gemma3) - RMSNorm fused patch support
 - Liquid LFM2/LFM2.5 (including 1.2B) - RMSNorm fused patch support
 - Mistral/Mixtral - RMSNorm fused patch support

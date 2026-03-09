@@ -43,7 +43,7 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
         "mistral" in arch or "mixtral" in arch for arch in architectures
     ):
         return patch_mistral(model)
-    if model_type == "qwen2":
+    if (model_type and "qwen" in model_type) or any("qwen" in arch for arch in architectures):
         return patch_qwen(model)
     if (model_type and "gemma" in model_type) or any("gemma" in arch for arch in architectures):
         return patch_gemma(model)
@@ -226,16 +226,35 @@ def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
 
 def patch_qwen(model: torch.nn.Module) -> torch.nn.Module:
     """
-    Patch Qwen/Qwen2 models with BarqTrain optimizations.
+    Patch Qwen family models with BarqTrain optimizations.
 
     Args:
-        model: A Qwen2ForCausalLM or compatible model
+        model: A Qwen family compatible model
 
     Returns:
         The patched model
     """
-    # TODO: Implement actual patching once kernels are ready
-    # This is a placeholder for Phase 3-5
+    rmsnorm_targets = [
+        ("transformers.models.qwen2.modeling_qwen2", "Qwen2RMSNorm", "Qwen2"),
+        ("transformers.models.qwen2_moe.modeling_qwen2_moe", "Qwen2MoeRMSNorm", "Qwen2Moe"),
+        ("transformers.models.qwen3.modeling_qwen3", "Qwen3RMSNorm", "Qwen3"),
+    ]
+
+    for module_name, class_name, label in rmsnorm_targets:
+        try:
+            module = importlib.import_module(module_name)
+            rmsnorm_cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        model = _patch_rmsnorm_layers(
+            model,
+            rmsnorm_cls,
+            label,
+            eps_attributes=("variance_epsilon", "eps"),
+            cast_input_to_float32=True,
+            cast_output_to_input_dtype=True,
+        )
+
     return model
 
 
