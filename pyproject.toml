@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel", "setuptools-rust>=1.9.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -54,6 +54,13 @@ benchmark = [
     "psutil>=5.9.0",
     "wandb>=0.15.0",
 ]
+cuda = [
+    "ninja",
+    "cmake>=3.20",
+]
+rust = [
+    "maturin>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/YASSERRMD/BarqTrain"
@@ -66,7 +73,7 @@ package-dir = {"" = "python"}
 [tool.setuptools.packages.find]
 where = ["python"]
 include = ["barqtrain*"]
-exclude = ["tests*", "benchmarks*", "rust*", "csrc*"]
+exclude = ["tests*", "benchmarks*"]
 
 [tool.black]
 line-length = 100

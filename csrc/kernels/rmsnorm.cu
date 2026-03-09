@@ -1,292 +1,120 @@
 /**
- * BarqTrain Fused RMSNorm Kernel
- *
- * Implements a fused RMSNorm with single read, shared memory reduction,
- * and single write for optimal memory bandwidth utilization.
- *
- * RMSNorm Formula:
- *   rms = sqrt(mean(x^2) + eps)
- *   output = (x / rms) * weight
- *
- * This implementation fuses the entire operation into a single kernel
- * to minimize HBM reads/writes.
+ * BarqTrain Fused RMSNorm — float32 only kernels.
+ * No templates → single nvcc specialization → safe on Colab 12 GB RAM.
  */
 
-#include <torch/extension.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <vector>
+#include <torch/extension.h>
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = (call); \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d - %s\n", \
-                    __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(1); \
-        } \
-    } while(0)
-
-// Warp-level reduction for sum
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
+// Warp reduce sum
+__device__ __forceinline__ float warp_sum(float v) {
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_down_sync(0xffffffff, v, off);
+  return v;
 }
 
-// Fused RMSNorm Forward Kernel
-template<typename T>
-__global__ void fused_rmsnorm_forward_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    T* __restrict__ output,
-    float* __restrict__ rms_cache,
-    float eps,
-    int batch_size,
-    int hidden_size
-) {
-    // Each thread block processes one row (one sequence in the batch)
-    int batch_idx = blockIdx.x;
-    int hidden_idx = threadIdx.x;
+// Forward: output = (x / rms) * weight
+__global__ void rmsnorm_fwd_f32(const float *__restrict__ x,
+                                const float *__restrict__ w,
+                                float *__restrict__ out,
+                                float *__restrict__ rms_cache, float eps,
+                                int H) {
+  int b = blockIdx.x;
+  int tid = threadIdx.x;
 
-    // Shared memory for reduction within the block
-    extern __shared__ float sdata[];
+  extern __shared__ float smem[];
 
-    // Load input value and compute square
-    float x_val = 0.0f;
-    if (hidden_idx < hidden_size) {
-        size_t idx = batch_idx * hidden_size + hidden_idx;
-        if constexpr (std::is_same<T, half>::value) {
-            x_val = __half2float(input[idx]);
-        } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-            x_val = __bfloat162float(input[idx]);
-        } else {
-            x_val = input[idx];
-        }
-    }
+  float sq = 0.f;
+  for (int i = tid; i < H; i += blockDim.x)
+    sq += x[b * H + i] * x[b * H + i];
 
-    // Compute sum of squares in shared memory
-    sdata[hidden_idx] = x_val * x_val;
+  smem[tid] = sq;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      smem[tid] += smem[tid + s];
     __syncthreads();
+  }
 
-    // Reduction in shared memory
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (hidden_idx < stride) {
-            sdata[hidden_idx] += sdata[hidden_idx + stride];
-        }
-        __syncthreads();
-    }
+  float rms = sqrtf(smem[0] / H + eps);
+  if (tid == 0 && rms_cache)
+    rms_cache[b] = rms;
 
-    // Compute RMS
-    float mean_square = sdata[0] / (float)hidden_size;
-    float rms = sqrtf(mean_square + eps);
-
-    // Cache RMS for backward pass (optional, can be recomputed)
-    if (hidden_idx == 0 && rms_cache != nullptr) {
-        rms_cache[batch_idx] = rms;
-    }
-
-    // Compute and write output
-    if (hidden_idx < hidden_size) {
-        size_t idx = batch_idx * hidden_size + hidden_idx;
-
-        // Load weight
-        float w_val = 0.0f;
-        if constexpr (std::is_same<T, half>::value) {
-            w_val = __half2float(weight[hidden_idx]);
-        } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-            w_val = __bfloat162float(weight[hidden_idx]);
-        } else {
-            w_val = weight[hidden_idx];
-        }
-
-        // RMSNorm: output = (x / rms) * weight
-        float out_val = (x_val / rms) * w_val;
-
-        if constexpr (std::is_same<T, half>::value) {
-            output[idx] = __float2half(out_val);
-        } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-            output[idx] = __float2bfloat16(out_val);
-        } else {
-            output[idx] = out_val;
-        }
-    }
+  for (int i = tid; i < H; i += blockDim.x)
+    out[b * H + i] = (x[b * H + i] / rms) * w[i];
 }
 
-// Fused RMSNorm Backward Kernel
-template<typename T>
-__global__ void fused_rmsnorm_backward_kernel(
-    const T* __restrict__ grad_output,
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const float* __restrict__ rms_cache,
-    T* __restrict__ grad_input,
-    T* __restrict__ grad_weight,
-    float eps,
-    int batch_size,
-    int hidden_size
-) {
-    int batch_idx = blockIdx.x;
-    int hidden_idx = threadIdx.x;
+// Backward
+__global__ void
+rmsnorm_bwd_f32(const float *__restrict__ dy, const float *__restrict__ x,
+                const float *__restrict__ w, const float *__restrict__ rms,
+                float *__restrict__ dx,
+                float *__restrict__ dw_acc, // float accumulator for grad_weight
+                int H) {
+  int b = blockIdx.x;
+  int tid = threadIdx.x;
 
-    extern __shared__ float sdata[];
+  extern __shared__ float smem[];
 
-    // Load values
-    float grad_out = 0.0f;
-    float x_val = 0.0f;
-    float w_val = 0.0f;
+  float r = rms[b];
 
-    if (hidden_idx < hidden_size) {
-        size_t idx = batch_idx * hidden_size + hidden_idx;
-
-        if constexpr (std::is_same<T, half>::value) {
-            grad_out = __half2float(grad_output[idx]);
-            x_val = __half2float(input[idx]);
-            w_val = __half2float(weight[hidden_idx]);
-        } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-            grad_out = __bfloat162float(grad_output[idx]);
-            x_val = __bfloat162float(input[idx]);
-            w_val = __bfloat162float(weight[hidden_idx]);
-        } else {
-            grad_out = grad_output[idx];
-            x_val = input[idx];
-            w_val = weight[hidden_idx];
-        }
-    }
-
-    // Get RMS (cached or recompute)
-    float rms = rms_cache[batch_idx];
-
-    // Compute intermediate values for gradient
-    float y = x_val / rms;
-    float grad_y = grad_out * w_val;  // Gradient before scaling by weight
-
-    // Reduction for sum term in gradient
-    sdata[hidden_idx] = grad_y * y;
+  // sum(dy * w * x/rms * x/rms)
+  float sum = 0.f;
+  for (int i = tid; i < H; i += blockDim.x) {
+    float y = x[b * H + i] / r;
+    sum += dy[b * H + i] * w[i] * y;
+  }
+  smem[tid] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      smem[tid] += smem[tid + s];
     __syncthreads();
+  }
+  float sum_dy_y = smem[0];
 
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (hidden_idx < stride) {
-            sdata[hidden_idx] += sdata[hidden_idx + stride];
-        }
-        __syncthreads();
-    }
-
-    float sum_dy_y = sdata[0];
-
-    // Compute gradients
-    if (hidden_idx < hidden_size) {
-        size_t idx = batch_idx * hidden_size + hidden_idx;
-
-        // grad_input = (grad_y - y * mean(dy * y)) / rms
-        float grad_in_val = (grad_y - y * sum_dy_y / (float)hidden_size) / rms;
-
-        if constexpr (std::is_same<T, half>::value) {
-            grad_input[idx] = __float2half(grad_in_val);
-        } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-            grad_input[idx] = __float2bfloat16(grad_in_val);
-        } else {
-            grad_input[idx] = grad_in_val;
-        }
-
-        // For grad_weight, we need atomic add across batches
-        // grad_weight = sum over batches of (grad_output * x / rms)
-        // This is typically handled separately with atomic adds
-        if (grad_weight != nullptr) {
-            float grad_w = grad_out * y;
-            atomicAdd(&grad_weight[hidden_idx], grad_w);
-        }
-    }
+  for (int i = tid; i < H; i += blockDim.x) {
+    float y = x[b * H + i] / r;
+    float gy = dy[b * H + i] * w[i];
+    dx[b * H + i] = (gy - y * sum_dy_y / H) / r;
+    atomicAdd(&dw_acc[i], dy[b * H + i] * y);
+  }
 }
 
-// Forward launcher
-torch::Tensor fused_rmsnorm_cuda(
-    torch::Tensor input,
-    torch::Tensor weight,
-    float eps
-) {
-    auto batch_size = input.size(0);
-    auto hidden_size = input.size(1);
+// ---- Launchers ----
 
-    // Allocate output tensor
-    auto output = torch::empty_like(input);
+torch::Tensor fused_rmsnorm_cuda(torch::Tensor input, torch::Tensor weight,
+                                 float eps) {
+  int B = input.size(0), H = input.size(1);
+  auto xf = input.to(torch::kFloat32).contiguous();
+  auto wf = weight.to(torch::kFloat32).contiguous();
+  auto out = torch::empty_like(xf);
+  auto rms = torch::empty({B}, xf.options());
 
-    // Allocate RMS cache for backward pass
-    auto rms_cache = torch::empty({batch_size}, input.options().dtype(torch::kFloat32));
+  int threads = std::min(H, 256);
+  rmsnorm_fwd_f32<<<B, threads, threads * sizeof(float)>>>(
+      xf.data_ptr<float>(), wf.data_ptr<float>(), out.data_ptr<float>(),
+      rms.data_ptr<float>(), eps, H);
 
-    // Launch kernel
-    const int threads = 256;
-    const int shared_mem_size = threads * sizeof(float);
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        input.scalar_type(), "fused_rmsnorm_forward", ([&] {
-            using T = scalar_t;
-            cudaDeviceProp props;
-            CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
-
-            // Adjust threads if hidden_size is smaller
-            int actual_threads = std::min(threads, (int)hidden_size);
-
-            fused_rmsnorm_forward_kernel<T><<<batch_size, actual_threads, shared_mem_size>>>(
-                input.data_ptr<T>(),
-                weight.data_ptr<T>(),
-                output.data_ptr<T>(),
-                rms_cache.data_ptr<float>(),
-                eps,
-                batch_size,
-                hidden_size
-            );
-            CUDA_CHECK(cudaGetLastError());
-        })
-    );
-
-    // Attach RMS cache as output metadata for backward pass
-    // In a real implementation, you'd use a custom autograd function
-
-    return output;
+  return out.to(input.scalar_type());
 }
 
-// Backward launcher
-torch::Tensor fused_rmsnorm_backward_cuda(
-    torch::Tensor grad_output,
-    torch::Tensor input,
-    torch::Tensor weight,
-    torch::Tensor rms
-) {
-    auto batch_size = input.size(0);
-    auto hidden_size = input.size(1);
+torch::Tensor fused_rmsnorm_backward_cuda(torch::Tensor grad_out,
+                                          torch::Tensor input,
+                                          torch::Tensor weight,
+                                          torch::Tensor rms) {
+  int B = input.size(0), H = input.size(1);
+  auto dyf = grad_out.to(torch::kFloat32).contiguous();
+  auto xf = input.to(torch::kFloat32).contiguous();
+  auto wf = weight.to(torch::kFloat32).contiguous();
+  auto rmsf = rms.to(torch::kFloat32).contiguous();
+  auto dxf = torch::empty_like(xf);
+  auto dwf = torch::zeros({H}, xf.options());
 
-    // Allocate gradient tensors
-    auto grad_input = torch::empty_like(input);
-    auto grad_weight = torch::zeros_like(weight);
+  int threads = std::min(H, 256);
+  rmsnorm_bwd_f32<<<B, threads, threads * sizeof(float)>>>(
+      dyf.data_ptr<float>(), xf.data_ptr<float>(), wf.data_ptr<float>(),
+      rmsf.data_ptr<float>(), dxf.data_ptr<float>(), dwf.data_ptr<float>(), H);
 
-    // Launch backward kernel
-    const int threads = 256;
-    const int shared_mem_size = threads * sizeof(float);
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        input.scalar_type(), "fused_rmsnorm_backward", ([&] {
-            using T = scalar_t;
-            int actual_threads = std::min(threads, (int)hidden_size);
-
-            fused_rmsnorm_backward_kernel<T><<<batch_size, actual_threads, shared_mem_size>>>(
-                grad_output.data_ptr<T>(),
-                input.data_ptr<T>(),
-                weight.data_ptr<T>(),
-                rms.data_ptr<float>(),
-                grad_input.data_ptr<T>(),
-                grad_weight.data_ptr<T>(),
-                1e-6f,  // eps
-                batch_size,
-                hidden_size
-            );
-            CUDA_CHECK(cudaGetLastError());
-        })
-    );
-
-    return grad_input;  // In practice, return tuple of (grad_input, grad_weight)
+  return dxf.to(input.scalar_type());
 }
