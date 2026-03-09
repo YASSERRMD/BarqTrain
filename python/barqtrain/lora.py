@@ -10,10 +10,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-try:
-    import barqtrain_cuda as _C
-except ImportError:
-    _C = None
+from barqtrain._ffi import load_cuda_backend
+
+_C = load_cuda_backend()
 
 
 class FusedLoRAFunction(torch.autograd.Function):
