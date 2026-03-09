@@ -24,10 +24,16 @@ if _here not in _sys.path:
     _sys.path.insert(0, _here)
 
 from barqtrain.patch_models import (
+    patch_deepseek,
     patch_gemma,
+    patch_granite,
+    patch_jamba,
     patch_lfm2,
     patch_llama,
+    patch_llama4,
     patch_mistral,
+    patch_olmo,
+    patch_phi,
     patch_model,
     patch_qwen,
 )
@@ -35,7 +41,13 @@ from barqtrain.patch_models import (
 __all__ = [
     "patch_model",
     "patch_llama",
+    "patch_llama4",
     "patch_mistral",
+    "patch_deepseek",
+    "patch_phi",
+    "patch_olmo",
+    "patch_granite",
+    "patch_jamba",
     "patch_gemma",
     "patch_lfm2",
     "patch_qwen",

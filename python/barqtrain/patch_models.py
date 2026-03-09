@@ -20,7 +20,7 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     reduced memory usage.
 
     Args:
-        model: A Hugging Face model (e.g., LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Lfm2ForCausalLM, GemmaForCausalLM)
+        model: A Hugging Face model (e.g., LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Lfm2ForCausalLM, GemmaForCausalLM, DeepseekV3ForCausalLM, Phi3ForCausalLM)
 
     Returns:
         The same model with BarqTrain optimizations applied
@@ -37,12 +37,24 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     model_type = getattr(model_config, "model_type", None)
     architectures = [arch.lower() for arch in getattr(model_config, "architectures", [])]
 
+    if model_type in {"llama4", "llama4_text"} or any("llama4" in arch for arch in architectures):
+        return patch_llama4(model)
     if model_type == "llama":
         return patch_llama(model)
     if model_type in {"mistral", "mixtral"} or any(
         "mistral" in arch or "mixtral" in arch for arch in architectures
     ):
         return patch_mistral(model)
+    if model_type in {"deepseek_v2", "deepseek_v3"} or any("deepseek" in arch for arch in architectures):
+        return patch_deepseek(model)
+    if model_type in {"phi3", "phi4_multimodal"} or any("phi3" in arch or "phi4" in arch for arch in architectures):
+        return patch_phi(model)
+    if model_type in {"olmo2", "olmoe"} or any("olmo" in arch for arch in architectures):
+        return patch_olmo(model)
+    if model_type == "granite" or any("granite" in arch for arch in architectures):
+        return patch_granite(model)
+    if model_type == "jamba" or any("jamba" in arch for arch in architectures):
+        return patch_jamba(model)
     if (model_type and "qwen" in model_type) or any("qwen" in arch for arch in architectures):
         return patch_qwen(model)
     if (model_type and "gemma" in model_type) or any("gemma" in arch for arch in architectures):
@@ -177,6 +189,167 @@ def patch_mistral(model: torch.nn.Module) -> torch.nn.Module:
         model = _patch_rmsnorm_layers(model, rmsnorm_cls, label)
 
     return model
+
+
+def patch_deepseek(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch DeepSeek family models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+    """
+    rmsnorm_targets = [
+        ("transformers.models.deepseek_v2.modeling_deepseek_v2", "DeepseekV2RMSNorm", "DeepSeekV2"),
+        ("transformers.models.deepseek_v3.modeling_deepseek_v3", "DeepseekV3RMSNorm", "DeepSeekV3"),
+    ]
+
+    for module_name, class_name, label in rmsnorm_targets:
+        try:
+            module = importlib.import_module(module_name)
+            rmsnorm_cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        model = _patch_rmsnorm_layers(
+            model,
+            rmsnorm_cls,
+            label,
+            eps_attributes=("variance_epsilon", "eps"),
+            cast_input_to_float32=True,
+            cast_output_to_input_dtype=True,
+        )
+
+    return model
+
+
+def patch_phi(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch Microsoft Phi family models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+    """
+    rmsnorm_targets = [
+        ("transformers.models.phi3.modeling_phi3", "Phi3RMSNorm", "Phi3"),
+        (
+            "transformers.models.phi4_multimodal.modeling_phi4_multimodal",
+            "Phi4MultimodalRMSNorm",
+            "Phi4Multimodal",
+        ),
+    ]
+
+    for module_name, class_name, label in rmsnorm_targets:
+        try:
+            module = importlib.import_module(module_name)
+            rmsnorm_cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        model = _patch_rmsnorm_layers(
+            model,
+            rmsnorm_cls,
+            label,
+            eps_attributes=("variance_epsilon", "eps"),
+            cast_input_to_float32=True,
+            cast_output_to_input_dtype=True,
+        )
+
+    return model
+
+
+def patch_olmo(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch OLMo family models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+    """
+    rmsnorm_targets = [
+        ("transformers.models.olmo2.modeling_olmo2", "Olmo2RMSNorm", "OLMo2"),
+        ("transformers.models.olmoe.modeling_olmoe", "OlmoeRMSNorm", "OLMoE"),
+    ]
+
+    for module_name, class_name, label in rmsnorm_targets:
+        try:
+            module = importlib.import_module(module_name)
+            rmsnorm_cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        model = _patch_rmsnorm_layers(
+            model,
+            rmsnorm_cls,
+            label,
+            eps_attributes=("variance_epsilon", "eps"),
+            cast_input_to_float32=True,
+            cast_output_to_input_dtype=True,
+        )
+
+    return model
+
+
+def patch_granite(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch IBM Granite models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+    """
+    try:
+        granite_model = importlib.import_module("transformers.models.granite.modeling_granite")
+        granite_rmsnorm = getattr(granite_model, "GraniteRMSNorm")
+    except (ImportError, AttributeError):
+        return model
+
+    return _patch_rmsnorm_layers(
+        model,
+        granite_rmsnorm,
+        "Granite",
+        eps_attributes=("variance_epsilon", "eps"),
+        cast_input_to_float32=True,
+        cast_output_to_input_dtype=True,
+    )
+
+
+def patch_jamba(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch AI21 Jamba models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+    """
+    try:
+        jamba_model = importlib.import_module("transformers.models.jamba.modeling_jamba")
+        jamba_rmsnorm = getattr(jamba_model, "JambaRMSNorm")
+    except (ImportError, AttributeError):
+        return model
+
+    return _patch_rmsnorm_layers(
+        model,
+        jamba_rmsnorm,
+        "Jamba",
+        eps_attributes=("variance_epsilon", "eps"),
+        cast_input_to_float32=True,
+        cast_output_to_input_dtype=True,
+    )
+
+
+def patch_llama4(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch Llama4 models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+    """
+    try:
+        llama4_model = importlib.import_module("transformers.models.llama4.modeling_llama4")
+        llama4_rmsnorm = getattr(llama4_model, "Llama4TextRMSNorm")
+    except (ImportError, AttributeError):
+        return model
+
+    return _patch_rmsnorm_layers(
+        model,
+        llama4_rmsnorm,
+        "Llama4",
+        eps_attributes=("eps", "variance_epsilon"),
+    )
 
 
 def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
