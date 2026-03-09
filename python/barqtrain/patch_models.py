@@ -54,27 +54,44 @@ def _patch_rmsnorm_layers(
     model: torch.nn.Module,
     rmsnorm_class: type,
     model_label: str,
+    eps_attributes: tuple = ("variance_epsilon", "eps"),
+    weight_transform=None,
+    cast_input_to_float32: bool = False,
+    cast_output_to_input_dtype: bool = False,
 ) -> torch.nn.Module:
     """
     Patch all matching RMSNorm layers in a model with BarqTrain fused RMSNorm.
     """
     from barqtrain.ops import fused_rms_norm
 
+    if weight_transform is None:
+        weight_transform = lambda w: w
+
     patched_count = 0
 
     for _, module in model.named_modules():
         if isinstance(module, rmsnorm_class):
-            original_weight = module.weight.data.clone()
-            eps = getattr(module, "variance_epsilon", 1e-6)
+            eps = 1e-6
+            for attr_name in eps_attributes:
+                if hasattr(module, attr_name):
+                    eps = getattr(module, attr_name)
+                    break
 
-            def make_forward(eps_value=eps):
+            def make_forward(
+                eps_value=eps,
+                transform=weight_transform,
+                cast_input=cast_input_to_float32,
+                cast_output=cast_output_to_input_dtype,
+            ):
                 def forward(self, x):
-                    return fused_rms_norm(x, self.weight, eps_value)
+                    input_x = x.float() if cast_input else x
+                    weight = transform(self.weight)
+                    output = fused_rms_norm(input_x, weight, eps_value)
+                    return output.type_as(x) if cast_output else output
 
                 return forward
 
             module.forward = types.MethodType(make_forward(), module)
-            module.weight.data = original_weight
             patched_count += 1
 
     if patched_count > 0:
@@ -161,7 +178,15 @@ def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
             rmsnorm_cls = getattr(module, class_name)
         except (ImportError, AttributeError):
             continue
-        model = _patch_rmsnorm_layers(model, rmsnorm_cls, label)
+        model = _patch_rmsnorm_layers(
+            model,
+            rmsnorm_cls,
+            label,
+            eps_attributes=("eps", "variance_epsilon"),
+            weight_transform=lambda w: 1.0 + w.float(),
+            cast_input_to_float32=True,
+            cast_output_to_input_dtype=True,
+        )
 
     return model
 
