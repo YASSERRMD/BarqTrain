@@ -40,26 +40,15 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install development dependencies
 pip install -e ".[dev]"
-
-# Install additional build tools
-pip install maturin ninja cmake
 ```
 
 ### Building Extensions
 
 ```bash
-# Build Rust extension
-cd rust
-maturin develop --release
+# Build via Python packaging (Rust + optional CUDA backend)
+pip install -e .
 
-# Build CUDA extension (requires CUDA toolkit)
-cd ../csrc
-mkdir build && cd build
-cmake ..
-make -j
-
-# Or use the Makefile
-cd ../../
+# Equivalent shortcut
 make build
 ```
 

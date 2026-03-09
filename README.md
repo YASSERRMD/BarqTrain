@@ -19,18 +19,21 @@
 git clone https://github.com/YASSERRMD/BarqTrain.git
 cd BarqTrain
 
-# Install Python dependencies
+# Install Python package + dependencies
+# Native Rust backend is built during install.
+# CUDA backend is built automatically when CUDA_HOME is set,
+# or JIT-built on first use via Python FFI loader.
 pip install -e .
+```
 
-# Build CUDA extension (requires CUDA toolkit)
-cd csrc
-mkdir build && cd build
-cmake ..
-make -j
+Optional environment flags:
 
-# Build Rust extension
-cd ../../rust
-maturin develop --release
+```bash
+# Disable runtime CUDA auto-build and force pure PyTorch fallback
+export BARQTRAIN_AUTO_BUILD=0
+
+# Show detailed build logs when CUDA JIT build runs
+export BARQTRAIN_VERBOSE_BUILD=1
 ```
 
 ### Quick Start
