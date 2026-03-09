@@ -23,11 +23,19 @@ _here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))  # python
 if _here not in _sys.path:
     _sys.path.insert(0, _here)
 
-from barqtrain.patch_models import patch_gemma, patch_lfm2, patch_llama, patch_model, patch_qwen
+from barqtrain.patch_models import (
+    patch_gemma,
+    patch_lfm2,
+    patch_llama,
+    patch_mistral,
+    patch_model,
+    patch_qwen,
+)
 
 __all__ = [
     "patch_model",
     "patch_llama",
+    "patch_mistral",
     "patch_gemma",
     "patch_lfm2",
     "patch_qwen",
