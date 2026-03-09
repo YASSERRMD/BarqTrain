@@ -7,14 +7,16 @@ for GIL-free, multi-threaded data processing.
 
 from typing import List, Optional
 
-try:
-    import barqtrain_rs as _rust
-except ImportError:
-    _rust = None
-    import warnings
+import warnings
 
+from barqtrain._ffi import load_rust_backend
+
+_rust = load_rust_backend()
+
+if _rust is None:
     warnings.warn(
-        "Rust extension not available. Install with: maturin develop --release"
+        "BarqTrain Rust backend unavailable. Using Python fallback implementations. "
+        "Install with: pip install -e ."
     )
 
 

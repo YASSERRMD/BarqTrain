@@ -5,19 +5,19 @@ This module provides PyTorch autograd wrappers for BarqTrain's
 CUDA kernels, enabling seamless integration with the PyTorch ecosystem.
 """
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 
-try:
-    import barqtrain_cuda as _C
-except ImportError:
-    _C = None
-    import warnings
+from barqtrain._ffi import load_cuda_backend
 
+_C = load_cuda_backend()
+
+if _C is None:
     warnings.warn(
-        "BarqTrain CUDA extension not available. "
-        "Falling back to PyTorch implementations. "
-        "Build with: python setup.py install"
+        "BarqTrain CUDA backend unavailable. Falling back to PyTorch implementations. "
+        "Install with: pip install -e ."
     )
 
 

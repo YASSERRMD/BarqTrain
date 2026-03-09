@@ -8,7 +8,10 @@ identical results to the standard PyTorch implementation.
 import pytest
 import torch
 
-pytest.importorskip("barqtrain_cuda", reason="CUDA extension not built")
+from barqtrain._ffi import load_cuda_backend
+
+if load_cuda_backend() is None:
+    pytest.skip("CUDA backend not available", allow_module_level=True)
 
 from barqtrain.ops import FusedRMSNorm, fused_rms_norm
 

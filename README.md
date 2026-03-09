@@ -155,6 +155,9 @@ cd BarqTrain
 
 # Install Python package (no compilation required)
 pip install -e .
+```
+
+Optional environment flags:
 
 # Optional: build CUDA kernels (requires NVIDIA GPU + CUDA toolkit)
 BARQTRAIN_BUILD_CUDA=1 pip install -e .
