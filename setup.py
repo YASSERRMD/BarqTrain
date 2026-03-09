@@ -1,50 +1,47 @@
 """
-Setup script for BarqTrain
+Setup script for BarqTrain.
 
-This script handles building both the CUDA C++ extension and the
-Rust PyO3 module.
+This setup builds:
+- CUDA C++ extension (when CUDA and Torch build helpers are available)
+- Rust extension via setuptools-rust (when Rust toolchain is available)
 """
 
-import os
-import subprocess
-import sys
+from __future__ import annotations
+
 from pathlib import Path
 
-from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from setuptools import find_packages, setup
 
-# Project metadata
-PROJECT_NAME = "barqtrain"
-VERSION = "0.1.0"
-DESCRIPTION = "High-performance LLM fine-tuning accelerator with CUDA kernels and Rust pipelines"
-LONG_DESCRIPTION = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
+PROJECT_ROOT = Path(__file__).parent.resolve()
 
 
-def build_cuda_extension():
-    """Build the CUDA C++ extension if CUDA is available."""
+def _get_cuda_build_config():
+    """Return (ext_modules, cmdclass) for optional CUDA extension."""
     try:
-        import torch
-        from torch.utils.cpp_extension import CUDA_HOME
+        from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+    except Exception as exc:
+        print(f"Warning: Torch CUDA build helpers unavailable, skipping CUDA extension: {exc}")
+        return [], {}
 
-        if CUDA_HOME is None and not os.path.exists("csrc"):
-            return None
+    if CUDA_HOME is None:
+        print("Warning: CUDA_HOME is not set; skipping CUDA extension build.")
+        return [], {}
 
-        # Source files for CUDA extension
-        sources = [
-            "csrc/src/bindings.cpp",
-            "csrc/kernels/rmsnorm.cu",
-            "csrc/kernels/flash_attention.cu",
-            "csrc/kernels/chunked_cross_entropy.cu",
-            "csrc/kernels/lora.cu",
-        ]
+    sources = [
+        PROJECT_ROOT / "csrc" / "src" / "bindings.cpp",
+        PROJECT_ROOT / "csrc" / "kernels" / "rmsnorm.cu",
+        PROJECT_ROOT / "csrc" / "kernels" / "flash_attention.cu",
+        PROJECT_ROOT / "csrc" / "kernels" / "chunked_cross_entropy.cu",
+        PROJECT_ROOT / "csrc" / "kernels" / "lora.cu",
+    ]
+    existing_sources = [str(src) for src in sources if src.exists()]
 
-        # Filter existing sources
-        existing_sources = [s for s in sources if Path(s).exists()]
+    if not existing_sources:
+        print("Warning: CUDA sources not found, skipping CUDA extension.")
+        return [], {}
 
-        if not existing_sources:
-            return None
-
-        ext = CUDAExtension(
+    ext_modules = [
+        CUDAExtension(
             name="barqtrain_cuda",
             sources=existing_sources,
             extra_compile_args={
@@ -58,75 +55,50 @@ def build_cuda_extension():
                 ],
             },
         )
-        return ext
-    except Exception as e:
-        print(f"Warning: Could not build CUDA extension: {e}")
-        return None
+    ]
+
+    return ext_modules, {"build_ext": BuildExtension}
 
 
-def build_rust_extension():
-    """Build the Rust PyO3 extension if Rust is available."""
+def _get_rust_extensions():
+    """Return rust_extensions list, or None when setuptools-rust is unavailable."""
+    cargo_toml = PROJECT_ROOT / "rust" / "Cargo.toml"
+    if not cargo_toml.exists():
+        return []
+
     try:
-        import torch
-
-        # Check if Rust and Cargo are available
-        result = subprocess.run(
-            ["cargo", "--version"],
-            capture_output=True,
-            text=True,
+        from setuptools_rust import Binding, RustExtension
+    except Exception as exc:
+        print(
+            "Warning: setuptools-rust unavailable, skipping Rust extension build: "
+            f"{exc}"
         )
-
-        if result.returncode != 0:
-            print("Warning: Rust/Cargo not found, skipping Rust extension")
-            return None
-
-        # Check if maturin is available
-        result = subprocess.run(
-            ["maturin", "--version"],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            print("Warning: maturin not found. Install with: pip install maturin")
-            return None
-
-        # Build Rust extension with maturin
-        rust_dir = Path("rust")
-        if not rust_dir.exists():
-            return None
-
-        print("Building Rust extension...")
-        result = subprocess.run(
-            ["maturin", "develop", "--release"],
-            cwd=rust_dir,
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            print(f"Warning: Rust build failed: {result.stderr}")
-            return None
-
-        print("Rust extension built successfully")
-        return None  # Maturin handles installation directly
-
-    except Exception as e:
-        print(f"Warning: Could not build Rust extension: {e}")
         return None
 
+    return [
+        RustExtension(
+            "barqtrain_rs",
+            path=str(cargo_toml),
+            binding=Binding.PyO3,
+            optional=True,
+        )
+    ]
 
-# Setup configuration
-setup(
-    name=PROJECT_NAME,
-    version=VERSION,
-    description=DESCRIPTION,
-    long_description=LONG_DESCRIPTION,
+
+cuda_ext_modules, cuda_cmdclass = _get_cuda_build_config()
+rust_extensions = _get_rust_extensions()
+
+setup_kwargs = dict(
+    name="barqtrain",
+    version="0.1.0",
+    description="High-performance LLM fine-tuning accelerator with CUDA kernels and Rust pipelines",
+    long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     author="BarqTrain Contributors",
     python_requires=">=3.8",
-    packages=["barqtrain", "barqtrain.benchmarks"],
+    packages=find_packages(where="python"),
     package_dir={"": "python"},
+    include_package_data=True,
     install_requires=[
         "torch>=2.0.0",
         "transformers>=4.35.0",
@@ -152,8 +124,9 @@ setup(
             "wandb>=0.15.0",
         ],
     },
-    ext_modules=[ext for ext in [build_cuda_extension()] if ext is not None],
-    cmdclass={"build_ext": BuildExtension} if build_cuda_extension() else {},
+    ext_modules=cuda_ext_modules,
+    cmdclass=cuda_cmdclass,
+    zip_safe=False,
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
@@ -178,7 +151,7 @@ setup(
     },
 )
 
-# Build Rust extension separately if available
-if "--build-rust" in sys.argv:
-    sys.argv.remove("--build-rust")
-    build_rust_extension()
+if rust_extensions is not None:
+    setup_kwargs["rust_extensions"] = rust_extensions
+
+setup(**setup_kwargs)

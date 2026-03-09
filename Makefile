@@ -3,21 +3,21 @@
 # Default target
 all: build
 
-# Build both CUDA and Rust extensions
-build: rust cuda
+# Build native extensions through Python packaging
+build:
+	@echo "Building BarqTrain backends via Python packaging..."
+	pip install -e . --no-deps
 
-# Build Rust extension
+# Rust backend note
 rust:
-	@echo "Building Rust extension..."
-	cd rust && maturin develop --release
+	@echo "Rust backend is built automatically by: pip install -e ."
 
-# Build CUDA extension
+# CUDA backend note
 cuda:
-	@echo "Building CUDA extension..."
-	python setup.py build_ext --inplace
+	@echo "CUDA backend is built automatically when CUDA_HOME is set."
 
 # Install the package
-install: build
+install:
 	@echo "Installing BarqTrain..."
 	pip install -e .
 
