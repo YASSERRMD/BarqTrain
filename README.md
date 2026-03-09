@@ -243,7 +243,7 @@ barqtrain/
 - Qwen/Qwen2 - Full support
 - Google Gemma family (Gemma, Gemma2, Gemma3) - RMSNorm fused patch support
 - Liquid LFM2/LFM2.5 (including 1.2B) - RMSNorm fused patch support
-- Mistral - Full support
+- Mistral/Mixtral - RMSNorm fused patch support
 - Any HF model with RMSNorm - Partial support
 
 ## Development

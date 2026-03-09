@@ -20,7 +20,7 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     reduced memory usage.
 
     Args:
-        model: A Hugging Face model (e.g., LlamaForCausalLM, Qwen2ForCausalLM, Lfm2ForCausalLM, GemmaForCausalLM)
+        model: A Hugging Face model (e.g., LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Lfm2ForCausalLM, GemmaForCausalLM)
 
     Returns:
         The same model with BarqTrain optimizations applied
@@ -39,6 +39,10 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
 
     if model_type == "llama":
         return patch_llama(model)
+    if model_type in {"mistral", "mixtral"} or any(
+        "mistral" in arch or "mixtral" in arch for arch in architectures
+    ):
+        return patch_mistral(model)
     if model_type == "qwen2":
         return patch_qwen(model)
     if (model_type and "gemma" in model_type) or any("gemma" in arch for arch in architectures):
@@ -144,6 +148,35 @@ def patch_lfm2(model: torch.nn.Module) -> torch.nn.Module:
         return model
 
     return _patch_rmsnorm_layers(model, lfm2_model.Lfm2RMSNorm, "LFM2")
+
+
+def patch_mistral(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch Mistral/Mixtral family models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+
+    Args:
+        model: A Mistral or Mixtral compatible model
+
+    Returns:
+        The patched model
+    """
+    rmsnorm_targets = [
+        ("transformers.models.mistral.modeling_mistral", "MistralRMSNorm", "Mistral"),
+        ("transformers.models.mixtral.modeling_mixtral", "MixtralRMSNorm", "Mixtral"),
+    ]
+
+    for module_name, class_name, label in rmsnorm_targets:
+        try:
+            module = importlib.import_module(module_name)
+            rmsnorm_cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        model = _patch_rmsnorm_layers(model, rmsnorm_cls, label)
+
+    return model
 
 
 def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:

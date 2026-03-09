@@ -35,6 +35,38 @@ def test_patch_model_routes_lfm2_by_model_type(monkeypatch):
     assert called["lfm2"] is True
 
 
+def test_patch_model_routes_mistral_by_model_type(monkeypatch):
+    model = DummyModel(model_type="mistral")
+
+    called = {"mistral": False}
+
+    def _patch_mistral(m):
+        called["mistral"] = True
+        return m
+
+    monkeypatch.setattr(patch_models, "patch_mistral", _patch_mistral)
+    patched = patch_models.patch_model(model)
+
+    assert patched is model
+    assert called["mistral"] is True
+
+
+def test_patch_model_routes_mixtral_by_architecture(monkeypatch):
+    model = DummyModel(model_type="unknown", architectures=["MixtralForCausalLM"])
+
+    called = {"mistral": False}
+
+    def _patch_mistral(m):
+        called["mistral"] = True
+        return m
+
+    monkeypatch.setattr(patch_models, "patch_mistral", _patch_mistral)
+    patched = patch_models.patch_model(model)
+
+    assert patched is model
+    assert called["mistral"] is True
+
+
 def test_patch_model_routes_gemma_by_model_type(monkeypatch):
     model = DummyModel(model_type="gemma2")
 
@@ -81,6 +113,37 @@ def test_patch_model_routes_lfm2_by_architecture(monkeypatch):
 
     assert patched is model
     assert called["lfm2"] is True
+
+
+def test_patch_mistral_patches_rmsnorm_forward():
+    pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.mistral.modeling_mistral")
+    from transformers.models.mistral.modeling_mistral import MistralRMSNorm
+
+    class TinyMistralModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="mistral",
+                architectures=["MistralForCausalLM"],
+            )
+            self.norm = MistralRMSNorm(16)
+
+        def forward(self, x):
+            return self.norm(x)
+
+    model = TinyMistralModel().eval()
+    x = torch.randn(3, 16, dtype=torch.float32)
+
+    before = model(x)
+    original_forward_impl = model.norm.forward.__func__
+
+    patch_models.patch_mistral(model)
+
+    assert model.norm.forward.__func__ is not original_forward_impl
+
+    after = model(x)
+    assert torch.allclose(before, after, rtol=1e-5, atol=1e-6)
 
 
 def test_patch_gemma_patches_rmsnorm_forward():
