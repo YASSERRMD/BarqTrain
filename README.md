@@ -239,11 +239,11 @@ barqtrain/
 
 ## Supported Models
 
-- Llama (1, 2, 3) - Full support
-- Qwen family (Qwen2, Qwen2-MoE, Qwen3) - RMSNorm fused patch support
-- Google Gemma family (Gemma, Gemma2, Gemma3) - RMSNorm fused patch support
-- Liquid LFM2/LFM2.5 (including 1.2B) - RMSNorm fused patch support
-- Mistral/Mixtral - RMSNorm fused patch support
+- Frontier/general LLMs: Llama (1, 2, 3, 4) - RMSNorm fused patch support
+- Enterprise/production: Qwen family (Qwen2, Qwen2-MoE, Qwen3), IBM Granite, AI21 Jamba - RMSNorm fused patch support
+- Reasoning/open frontier: DeepSeek family (V2, V3), Mistral/Mixtral - RMSNorm fused patch support
+- Efficient edge models: Microsoft Phi family (Phi-3, Phi-4 Multimodal), Liquid LFM2/LFM2.5 (including 1.2B) - RMSNorm fused patch support
+- Research/open science: OLMo family (OLMo2, OLMoE), Google Gemma family (Gemma, Gemma2, Gemma3) - RMSNorm fused patch support
 - Any HF model with RMSNorm - Partial support
 
 ## Development
