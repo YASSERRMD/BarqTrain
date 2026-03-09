@@ -15,6 +15,14 @@ Basic usage:
 
 __version__ = "0.1.0"
 
+# Ensure the package is importable even when running directly from the repo
+# (e.g. on Colab after git clone without pip install -e .)
+import os as _os
+import sys as _sys
+_here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))  # python/
+if _here not in _sys.path:
+    _sys.path.insert(0, _here)
+
 from barqtrain.patch_models import patch_model, patch_llama, patch_qwen
 
 __all__ = [

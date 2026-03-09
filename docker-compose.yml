@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: barqtrain-test:latest
+    # Override CMD to add any extra pytest flags at runtime:
+    #   docker compose run test pytest tests/ -k "not slow"
+    command: [ "pytest", "tests/", "-v", "--tb=short", "-x" ]
+    volumes:
+      # Mount source for faster iteration during development
+      - .:/app
+    environment:
+      # Suppress torch GPU warnings on CPU-only containers
+      - CUDA_VISIBLE_DEVICES=""
