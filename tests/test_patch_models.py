@@ -52,6 +52,23 @@ def test_patch_model_routes_top_families(monkeypatch, model_type, architectures,
     assert called["hit"] is True
 
 
+def test_patch_model_skips_when_already_patched(monkeypatch):
+    model = DummyModel(model_type="qwen2", architectures=["Qwen2ForCausalLM"])
+
+    called = {"count": 0}
+
+    def _patch_qwen(m):
+        called["count"] += 1
+        return m
+
+    monkeypatch.setattr(patch_models, "patch_qwen", _patch_qwen)
+
+    patch_models.patch_model(model)
+    patch_models.patch_model(model)
+
+    assert called["count"] == 1
+
+
 def test_patch_model_routes_lfm2_by_model_type(monkeypatch):
     model = DummyModel(model_type="lfm2")
 
