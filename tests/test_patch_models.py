@@ -67,6 +67,38 @@ def test_patch_model_routes_mixtral_by_architecture(monkeypatch):
     assert called["mistral"] is True
 
 
+def test_patch_model_routes_qwen_by_model_type(monkeypatch):
+    model = DummyModel(model_type="qwen2")
+
+    called = {"qwen": False}
+
+    def _patch_qwen(m):
+        called["qwen"] = True
+        return m
+
+    monkeypatch.setattr(patch_models, "patch_qwen", _patch_qwen)
+    patched = patch_models.patch_model(model)
+
+    assert patched is model
+    assert called["qwen"] is True
+
+
+def test_patch_model_routes_qwen_by_architecture(monkeypatch):
+    model = DummyModel(model_type="unknown", architectures=["Qwen3ForCausalLM"])
+
+    called = {"qwen": False}
+
+    def _patch_qwen(m):
+        called["qwen"] = True
+        return m
+
+    monkeypatch.setattr(patch_models, "patch_qwen", _patch_qwen)
+    patched = patch_models.patch_model(model)
+
+    assert patched is model
+    assert called["qwen"] is True
+
+
 def test_patch_model_routes_gemma_by_model_type(monkeypatch):
     model = DummyModel(model_type="gemma2")
 
@@ -139,6 +171,34 @@ def test_patch_mistral_patches_rmsnorm_forward():
     original_forward_impl = model.norm.forward.__func__
 
     patch_models.patch_mistral(model)
+
+    assert model.norm.forward.__func__ is not original_forward_impl
+
+    after = model(x)
+    assert torch.allclose(before, after, rtol=1e-5, atol=1e-6)
+
+
+def test_patch_qwen_patches_rmsnorm_forward():
+    pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+    class TinyQwenModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(model_type="qwen2", architectures=["Qwen2ForCausalLM"])
+            self.norm = Qwen2RMSNorm(16)
+
+        def forward(self, x):
+            return self.norm(x)
+
+    model = TinyQwenModel().eval()
+    x = torch.randn(3, 16, dtype=torch.float32)
+
+    before = model(x)
+    original_forward_impl = model.norm.forward.__func__
+
+    patch_models.patch_qwen(model)
 
     assert model.norm.forward.__func__ is not original_forward_impl
 
