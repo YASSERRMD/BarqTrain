@@ -106,6 +106,7 @@ barqtrain/
 
 - Llama (1, 2, 3) - Full support
 - Qwen/Qwen2 - Full support
+- Liquid LFM2/LFM2.5 (including 1.2B) - RMSNorm fused patch support
 - Mistral - Full support
 - Any HF model with RMSNorm - Partial support
 
