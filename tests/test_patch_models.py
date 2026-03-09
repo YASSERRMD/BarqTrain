@@ -19,6 +19,39 @@ class DummyModel(torch.nn.Module):
         )
 
 
+@pytest.mark.parametrize(
+    "model_type,architectures,patch_attr",
+    [
+        ("deepseek_v3", [], "patch_deepseek"),
+        ("phi3", [], "patch_phi"),
+        ("olmo2", [], "patch_olmo"),
+        ("granite", [], "patch_granite"),
+        ("jamba", [], "patch_jamba"),
+        ("llama4_text", [], "patch_llama4"),
+        ("unknown", ["DeepseekV3ForCausalLM"], "patch_deepseek"),
+        ("unknown", ["Phi3ForCausalLM"], "patch_phi"),
+        ("unknown", ["Olmo2ForCausalLM"], "patch_olmo"),
+        ("unknown", ["GraniteForCausalLM"], "patch_granite"),
+        ("unknown", ["JambaForCausalLM"], "patch_jamba"),
+        ("unknown", ["Llama4ForConditionalGeneration"], "patch_llama4"),
+    ],
+)
+def test_patch_model_routes_top_families(monkeypatch, model_type, architectures, patch_attr):
+    model = DummyModel(model_type=model_type, architectures=architectures)
+
+    called = {"hit": False}
+
+    def _patch(m):
+        called["hit"] = True
+        return m
+
+    monkeypatch.setattr(patch_models, patch_attr, _patch)
+    patched = patch_models.patch_model(model)
+
+    assert patched is model
+    assert called["hit"] is True
+
+
 def test_patch_model_routes_lfm2_by_model_type(monkeypatch):
     model = DummyModel(model_type="lfm2")
 
@@ -171,6 +204,96 @@ def test_patch_mistral_patches_rmsnorm_forward():
     original_forward_impl = model.norm.forward.__func__
 
     patch_models.patch_mistral(model)
+
+    assert model.norm.forward.__func__ is not original_forward_impl
+
+    after = model(x)
+    assert torch.allclose(before, after, rtol=1e-5, atol=1e-6)
+
+
+def test_patch_deepseek_patches_rmsnorm_forward():
+    pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.deepseek_v3.modeling_deepseek_v3")
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3RMSNorm
+
+    class TinyDeepseekModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="deepseek_v3",
+                architectures=["DeepseekV3ForCausalLM"],
+            )
+            self.norm = DeepseekV3RMSNorm(16)
+
+        def forward(self, x):
+            return self.norm(x)
+
+    model = TinyDeepseekModel().eval()
+    x = torch.randn(3, 16, dtype=torch.float32)
+
+    before = model(x)
+    original_forward_impl = model.norm.forward.__func__
+
+    patch_models.patch_deepseek(model)
+
+    assert model.norm.forward.__func__ is not original_forward_impl
+
+    after = model(x)
+    assert torch.allclose(before, after, rtol=1e-5, atol=1e-6)
+
+
+def test_patch_phi_patches_rmsnorm_forward():
+    pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.phi3.modeling_phi3")
+    from transformers.models.phi3.modeling_phi3 import Phi3RMSNorm
+
+    class TinyPhiModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(model_type="phi3", architectures=["Phi3ForCausalLM"])
+            self.norm = Phi3RMSNorm(16)
+
+        def forward(self, x):
+            return self.norm(x)
+
+    model = TinyPhiModel().eval()
+    x = torch.randn(3, 16, dtype=torch.float32)
+
+    before = model(x)
+    original_forward_impl = model.norm.forward.__func__
+
+    patch_models.patch_phi(model)
+
+    assert model.norm.forward.__func__ is not original_forward_impl
+
+    after = model(x)
+    assert torch.allclose(before, after, rtol=1e-5, atol=1e-6)
+
+
+def test_patch_llama4_patches_rmsnorm_forward():
+    pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.llama4.modeling_llama4")
+    from transformers.models.llama4.modeling_llama4 import Llama4TextRMSNorm
+
+    class TinyLlama4Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="llama4_text",
+                architectures=["Llama4ForConditionalGeneration"],
+            )
+            self.norm = Llama4TextRMSNorm(16)
+
+        def forward(self, x):
+            return self.norm(x)
+
+    model = TinyLlama4Model().eval()
+    x = torch.randn(3, 16, dtype=torch.float32)
+
+    before = model(x)
+    original_forward_impl = model.norm.forward.__func__
+
+    patch_models.patch_llama4(model)
 
     assert model.norm.forward.__func__ is not original_forward_impl
 
