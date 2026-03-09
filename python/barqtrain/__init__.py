@@ -15,11 +15,12 @@ Basic usage:
 
 __version__ = "0.1.0"
 
-from barqtrain.patch_models import patch_model, patch_llama, patch_qwen
+from barqtrain.patch_models import patch_lfm2, patch_llama, patch_model, patch_qwen
 
 __all__ = [
     "patch_model",
     "patch_llama",
+    "patch_lfm2",
     "patch_qwen",
     "__version__",
 ]
