@@ -5,6 +5,7 @@ This module provides functions to monkey-patch Hugging Face models
 with BarqTrain's optimized CUDA kernels and Rust operations.
 """
 
+import importlib
 import types
 
 import torch
@@ -19,7 +20,7 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     reduced memory usage.
 
     Args:
-        model: A Hugging Face model (e.g., LlamaForCausalLM, Qwen2ForCausalLM, Lfm2ForCausalLM)
+        model: A Hugging Face model (e.g., LlamaForCausalLM, Qwen2ForCausalLM, Lfm2ForCausalLM, GemmaForCausalLM)
 
     Returns:
         The same model with BarqTrain optimizations applied
@@ -40,6 +41,8 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
         return patch_llama(model)
     if model_type == "qwen2":
         return patch_qwen(model)
+    if (model_type and "gemma" in model_type) or any("gemma" in arch for arch in architectures):
+        return patch_gemma(model)
     if model_type == "lfm2" or any(arch.startswith("lfm2") for arch in architectures):
         return patch_lfm2(model)
 
@@ -51,27 +54,44 @@ def _patch_rmsnorm_layers(
     model: torch.nn.Module,
     rmsnorm_class: type,
     model_label: str,
+    eps_attributes: tuple = ("variance_epsilon", "eps"),
+    weight_transform=None,
+    cast_input_to_float32: bool = False,
+    cast_output_to_input_dtype: bool = False,
 ) -> torch.nn.Module:
     """
     Patch all matching RMSNorm layers in a model with BarqTrain fused RMSNorm.
     """
     from barqtrain.ops import fused_rms_norm
 
+    if weight_transform is None:
+        weight_transform = lambda w: w
+
     patched_count = 0
 
     for _, module in model.named_modules():
         if isinstance(module, rmsnorm_class):
-            original_weight = module.weight.data.clone()
-            eps = getattr(module, "variance_epsilon", 1e-6)
+            eps = 1e-6
+            for attr_name in eps_attributes:
+                if hasattr(module, attr_name):
+                    eps = getattr(module, attr_name)
+                    break
 
-            def make_forward(eps_value=eps):
+            def make_forward(
+                eps_value=eps,
+                transform=weight_transform,
+                cast_input=cast_input_to_float32,
+                cast_output=cast_output_to_input_dtype,
+            ):
                 def forward(self, x):
-                    return fused_rms_norm(x, self.weight, eps_value)
+                    input_x = x.float() if cast_input else x
+                    weight = transform(self.weight)
+                    output = fused_rms_norm(input_x, weight, eps_value)
+                    return output.type_as(x) if cast_output else output
 
                 return forward
 
             module.forward = types.MethodType(make_forward(), module)
-            module.weight.data = original_weight
             patched_count += 1
 
     if patched_count > 0:
@@ -124,6 +144,51 @@ def patch_lfm2(model: torch.nn.Module) -> torch.nn.Module:
         return model
 
     return _patch_rmsnorm_layers(model, lfm2_model.Lfm2RMSNorm, "LFM2")
+
+
+def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Patch Google Gemma family models with BarqTrain optimizations.
+
+    Replaces:
+    - RMSNorm with fused RMSNorm kernel
+
+    Supported classes include Gemma/Gemma2/Gemma3 and RecurrentGemma RMSNorm.
+
+    Args:
+        model: A Gemma-family model
+
+    Returns:
+        The patched model
+    """
+    rmsnorm_targets = [
+        ("transformers.models.gemma.modeling_gemma", "GemmaRMSNorm", "Gemma"),
+        ("transformers.models.gemma2.modeling_gemma2", "Gemma2RMSNorm", "Gemma2"),
+        ("transformers.models.gemma3.modeling_gemma3", "Gemma3RMSNorm", "Gemma3"),
+        (
+            "transformers.models.recurrent_gemma.modeling_recurrent_gemma",
+            "RecurrentGemmaRMSNorm",
+            "RecurrentGemma",
+        ),
+    ]
+
+    for module_name, class_name, label in rmsnorm_targets:
+        try:
+            module = importlib.import_module(module_name)
+            rmsnorm_cls = getattr(module, class_name)
+        except (ImportError, AttributeError):
+            continue
+        model = _patch_rmsnorm_layers(
+            model,
+            rmsnorm_cls,
+            label,
+            eps_attributes=("eps", "variance_epsilon"),
+            weight_transform=lambda w: 1.0 + w.float(),
+            cast_input_to_float32=True,
+            cast_output_to_input_dtype=True,
+        )
+
+    return model
 
 
 def patch_qwen(model: torch.nn.Module) -> torch.nn.Module:
