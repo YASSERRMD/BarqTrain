@@ -146,6 +146,13 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
 ---
 
+### Ready-to-use Colab notebooks (in this repo)
+
+- `examples/barqtrain_training_inference_colab.ipynb`
+  - End-to-end setup, short training run, and inference demo with `patch_model(...)`.
+- `examples/barqtrain_benchmark_comparison_colab.ipynb`
+  - Benchmark comparison across baseline HF/PyTorch, BarqTrain patch, BarqTrain with CUDA path enabled, and Unsloth AI (if installed).
+
 ### Local (from source)
 
 ```bash
