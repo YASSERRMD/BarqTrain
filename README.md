@@ -28,7 +28,8 @@ the Rust toolchain first and fails immediately if `barqtrain_rs` does not build.
 # Cell 1 – clone, install, and verify (run once per Colab session)
 !git clone https://github.com/YASSERRMD/BarqTrain.git
 %cd BarqTrain
-!apt-get install -y python3-dev curl build-essential
+!apt-get update -y
+!DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev curl build-essential
 !curl https://sh.rustup.rs -sSf | sh -s -- -y
 import os
 os.environ["PATH"] = f"{os.path.expanduser('~/.cargo/bin')}:{os.environ['PATH']}"
@@ -59,7 +60,8 @@ The CUDA kernels give the biggest speedups. Compilation takes ~2 min on Colab.
 ```python
 # Cell 3a – install Python dev headers (required to compile C extensions)
 # Without this you get: fatal error: Python.h: No such file or directory
-!apt-get install -y python3-dev
+!apt-get update -y
+!DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev
 
 # Cell 3b – compile CUDA kernels (T4 / A100 / L4 / V100 all supported)
 !BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
