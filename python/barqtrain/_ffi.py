@@ -9,9 +9,11 @@ This module centralizes Python-side FFI loading for optional native backends:
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
+import shutil
+import sys
 import warnings
-from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Optional
@@ -24,6 +26,10 @@ _CUDA_SOURCES = (
     _PROJECT_ROOT / "csrc" / "kernels" / "chunked_cross_entropy.cu",
     _PROJECT_ROOT / "csrc" / "kernels" / "lora.cu",
 )
+_CUDA_BACKEND: Optional[ModuleType] = None
+_RUST_BACKEND: Optional[ModuleType] = None
+_CUDA_BUILD_FAILED = False
+_RUST_BUILD_FAILED = False
 
 
 def _env_enabled(name: str, default: str = "1") -> bool:
@@ -31,7 +37,49 @@ def _env_enabled(name: str, default: str = "1") -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
-@lru_cache(maxsize=1)
+def _detect_cuda_home() -> Optional[str]:
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_home = os.environ.get(env_name)
+        if cuda_home and Path(cuda_home).exists():
+            return cuda_home
+
+    try:
+        import torch
+        import torch.utils.cpp_extension as cpp_extension
+
+        cuda_home = cpp_extension.CUDA_HOME
+        if cuda_home:
+            return cuda_home
+
+        find_cuda_home = getattr(cpp_extension, "_find_cuda_home", None)
+        if callable(find_cuda_home):
+            cuda_home = find_cuda_home()
+            if cuda_home:
+                return cuda_home
+
+        if torch.version.cuda:
+            version = torch.version.cuda
+            candidates = [
+                f"/usr/local/cuda-{version}",
+                f"/usr/local/cuda-{version.split('.')[0]}",
+            ]
+            for candidate in candidates:
+                if Path(candidate).exists():
+                    return candidate
+    except Exception:
+        pass
+
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return str(Path(nvcc).resolve().parents[1])
+
+    for candidate in ("/usr/local/cuda", "/opt/cuda"):
+        if Path(candidate).exists():
+            return candidate
+
+    return None
+
+
 def load_cuda_backend() -> Optional[ModuleType]:
     """
     Load the CUDA backend module.
@@ -41,10 +89,18 @@ def load_cuda_backend() -> Optional[ModuleType]:
     2) If not available and auto-build is enabled, JIT-build with Torch extension loader.
     3) Fall back to None.
     """
+    global _CUDA_BACKEND, _CUDA_BUILD_FAILED
+    if _CUDA_BACKEND is not None:
+        return _CUDA_BACKEND
+
     try:
-        return importlib.import_module("barqtrain_cuda")
+        _CUDA_BACKEND = importlib.import_module("barqtrain_cuda")
+        return _CUDA_BACKEND
     except ImportError:
         pass
+
+    if _CUDA_BUILD_FAILED:
+        return None
 
     if not _env_enabled("BARQTRAIN_AUTO_BUILD", "1"):
         return None
@@ -58,17 +114,24 @@ def load_cuda_backend() -> Optional[ModuleType]:
         return None
 
     try:
-        from torch.utils.cpp_extension import CUDA_HOME, load
+        import torch.utils.cpp_extension as cpp_extension
     except Exception as exc:
         warnings.warn(
             f"BarqTrain CUDA auto-build skipped because Torch build helpers are unavailable: {exc}"
         )
         return None
 
-    if CUDA_HOME is None:
+    cuda_home = _detect_cuda_home()
+    if cuda_home:
+        os.environ.setdefault("CUDA_HOME", cuda_home)
+        cpp_extension.CUDA_HOME = cuda_home
+    elif cpp_extension.CUDA_HOME is not None:
+        cuda_home = cpp_extension.CUDA_HOME
+
+    if cuda_home is None:
         warnings.warn(
-            "BarqTrain CUDA auto-build skipped because CUDA_HOME is not set. "
-            "Set CUDA_HOME or pre-build the extension."
+            "BarqTrain CUDA auto-build skipped because a CUDA toolkit was not found. "
+            "Set CUDA_HOME or install the extension with BARQTRAIN_BUILD_CUDA=1."
         )
         return None
 
@@ -76,7 +139,7 @@ def load_cuda_backend() -> Optional[ModuleType]:
     build_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        return load(
+        _CUDA_BACKEND = cpp_extension.load(
             name="barqtrain_cuda",
             sources=[str(src) for src in _CUDA_SOURCES],
             extra_cflags=["-O3", "-std=c++17"],
@@ -91,17 +154,53 @@ def load_cuda_backend() -> Optional[ModuleType]:
             build_directory=str(build_dir),
             verbose=_env_enabled("BARQTRAIN_VERBOSE_BUILD", "0"),
         )
+        return _CUDA_BACKEND
     except Exception as exc:
+        _CUDA_BUILD_FAILED = True
         warnings.warn(f"BarqTrain CUDA auto-build failed: {exc}")
         return None
 
 
-@lru_cache(maxsize=1)
 def load_rust_backend() -> Optional[ModuleType]:
     """
     Load the Rust backend Python extension if available.
     """
+    global _RUST_BACKEND, _RUST_BUILD_FAILED
+    if _RUST_BACKEND is not None:
+        return _RUST_BACKEND
+
     try:
-        return importlib.import_module("barqtrain_rs")
+        _RUST_BACKEND = importlib.import_module("barqtrain_rs")
+        return _RUST_BACKEND
     except ImportError:
+        if _RUST_BUILD_FAILED:
+            return None
+        if not _env_enabled("BARQTRAIN_AUTO_BUILD", "1"):
+            return None
+
+        if shutil.which("cargo") and importlib.util.find_spec("maturin") is not None:
+            try:
+                import subprocess
+
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "maturin",
+                        "develop",
+                        "--release",
+                        "--manifest-path",
+                        str(_PROJECT_ROOT / "rust" / "Cargo.toml"),
+                    ],
+                    cwd=str(_PROJECT_ROOT),
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                _RUST_BACKEND = importlib.import_module("barqtrain_rs")
+                return _RUST_BACKEND
+            except Exception:
+                _RUST_BUILD_FAILED = True
+                return None
         return None

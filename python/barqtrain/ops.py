@@ -12,13 +12,22 @@ import torch.nn.functional as F
 
 from barqtrain._ffi import load_cuda_backend
 
-_C = load_cuda_backend()
+_CUDA_FALLBACK_WARNED = False
 
-if _C is None:
+
+def _get_cuda_backend():
+    return load_cuda_backend()
+
+
+def _warn_cuda_fallback_once() -> None:
+    global _CUDA_FALLBACK_WARNED
+    if _CUDA_FALLBACK_WARNED:
+        return
     warnings.warn(
         "BarqTrain CUDA backend unavailable. Falling back to PyTorch implementations. "
         "Install with: pip install -e ."
     )
+    _CUDA_FALLBACK_WARNED = True
 
 
 class FusedRMSNormFunction(torch.autograd.Function):
@@ -42,14 +51,17 @@ class FusedRMSNormFunction(torch.autograd.Function):
         Returns:
             Normalized output tensor
         """
-        if _C is not None:
+        cuda_backend = _get_cuda_backend()
+        if cuda_backend is not None:
             # Use CUDA kernel
             rms_cache = torch.empty(x.size(0), dtype=torch.float32, device=x.device)
-            output = _C.fused_rmsnorm(x, weight, eps)
+            output = cuda_backend.fused_rmsnorm(x, weight, eps)
             ctx.save_for_backward(x, weight, rms_cache)
             ctx.eps = eps
             return output
         else:
+            if x.is_cuda:
+                _warn_cuda_fallback_once()
             # Fallback to PyTorch implementation
             variance = x.pow(2).mean(dim=-1, keepdim=True) + eps
             x = x * torch.rsqrt(variance)
@@ -68,10 +80,11 @@ class FusedRMSNormFunction(torch.autograd.Function):
         Returns:
             Tuple of (grad_input, grad_weight, None)
         """
-        if _C is not None:
+        cuda_backend = _get_cuda_backend()
+        if cuda_backend is not None:
             # Use CUDA kernel
             x, weight, rms_cache = ctx.saved_tensors
-            grad_input = _C.fused_rmsnorm_backward(grad_output, x, weight, rms_cache)
+            grad_input = cuda_backend.fused_rmsnorm_backward(grad_output, x, weight, rms_cache)
             # Compute grad_weight (simplified - should use atomic adds in kernel)
             y = x / rms_cache.unsqueeze(1)
             grad_weight = (grad_output * y).sum(dim=0)
@@ -192,14 +205,17 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         Returns:
             Loss tensor (scalar)
         """
-        if _C is not None:
+        cuda_backend = _get_cuda_backend()
+        if cuda_backend is not None:
             # Use CUDA kernel
-            losses, grad_hidden = _C.chunked_cross_entropy(
+            losses, grad_hidden = cuda_backend.chunked_cross_entropy(
                 hidden_states, lm_head_weight, labels
             )
             ctx.save_for_backward(hidden_states, lm_head_weight, labels, grad_hidden)
             return losses.mean()
         else:
+            if hidden_states.is_cuda:
+                _warn_cuda_fallback_once()
             # Fallback to PyTorch implementation
             # Compute logits: [batch, seq_len, vocab_size]
             logits = torch.nn.functional.linear(hidden_states, lm_head_weight)
@@ -223,7 +239,8 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         Returns:
             Tuple of (grad_hidden_states, grad_lm_head_weight, None)
         """
-        if _C is not None:
+        cuda_backend = _get_cuda_backend()
+        if cuda_backend is not None:
             # Use pre-computed gradient from CUDA kernel
             _, _, labels, grad_hidden = ctx.saved_tensors
             return grad_hidden * grad_output, None, None
@@ -307,12 +324,15 @@ class FlashAttentionFunction(torch.autograd.Function):
         Returns:
             Attention output tensor
         """
-        if _C is not None:
+        cuda_backend = _get_cuda_backend()
+        if cuda_backend is not None:
             # Use CUDA kernel with fused RoPE
-            output = _C.flash_attention(q, k, v)
+            output = cuda_backend.flash_attention(q, k, v)
             ctx.save_for_backward(q, k, v)
             return output
         else:
+            if q.is_cuda:
+                _warn_cuda_fallback_once()
             # Fallback to PyTorch scaled dot-product attention
             # Apply RoPE manually
             q, k = apply_rope_to_qk(q, k)
