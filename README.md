@@ -151,7 +151,7 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
 - Training + Inference (`examples/barqtrain_training_inference_colab.ipynb`): [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_training_inference_colab.ipynb)
 - Benchmark Comparison (`examples/barqtrain_benchmark_comparison_colab.ipynb`): [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_benchmark_comparison_colab.ipynb)
-  Uses `ninja`, cleans up VRAM between runs, compares full-weight Unsloth vs baseline vs BarqTrain patch vs BarqTrain CUDA backend.
+  Uses `ninja`, your requested Unsloth install flow, cleans up VRAM between runs, and marks the BarqTrain CUDA result valid only when `cuda_backend_loaded == True`.
 
 ### Local (from source)
 
