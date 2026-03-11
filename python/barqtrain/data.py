@@ -5,6 +5,7 @@ This module provides Python wrappers around the Rust implementation
 for GIL-free, multi-threaded data processing.
 """
 
+import os
 from typing import Dict, List, Optional
 
 import warnings
@@ -28,6 +29,21 @@ def _warn_rust_fallback_once() -> None:
         "Install with: pip install -e ."
     )
     _RUST_FALLBACK_WARNED = True
+
+
+def _rust_backend_required() -> bool:
+    value = os.environ.get("BARQTRAIN_REQUIRE_RUST", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _handle_missing_rust_backend() -> None:
+    if _rust_backend_required():
+        raise RuntimeError(
+            "BarqTrain Rust backend is required but unavailable. "
+            "Install/build it first with `pip install -e . --no-build-isolation` "
+            "after installing a Rust toolchain."
+        )
+    _warn_rust_fallback_once()
 
 
 class PackedBatch:
@@ -117,7 +133,7 @@ def pack_sequences(
             for batch in rust_batches
         ]
     else:
-        _warn_rust_fallback_once()
+        _handle_missing_rust_backend()
         # Fallback to simple Python implementation
         return _pack_sequences_python(sequences, max_len)
 
@@ -204,7 +220,7 @@ def parallel_tokenize(texts: List[str], tokenizer_path: str) -> List[List[int]]:
         tokenized = rust_backend.parallel_tokenize(texts, tokenizer_path)
         return [list(seq) for seq in tokenized]
     else:
-        _warn_rust_fallback_once()
+        _handle_missing_rust_backend()
         # Fallback: simple character tokenization
         return [[ord(c) for c in text] for text in texts]
 
@@ -270,7 +286,7 @@ def pack_for_causal_lm(
             for batch in rust_batches
         ]
 
-    _warn_rust_fallback_once()
+    _handle_missing_rust_backend()
     return _pack_for_causal_lm_python(
         sequences=sequences,
         max_length=max_length,

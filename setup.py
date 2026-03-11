@@ -15,6 +15,12 @@ from setuptools import setup
 _cuda_ext = None
 _build_ext_cls = {}
 _rust_extensions = []
+_rust_optional = os.environ.get("BARQTRAIN_OPTIONAL_RUST", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _detect_cuda_home(initial_cuda_home=None):
@@ -60,7 +66,7 @@ try:
                 path="rust/Cargo.toml",
                 binding=Binding.PyO3,
                 debug=False,
-                optional=True,
+                optional=_rust_optional,
             )
         )
 except Exception as e:
