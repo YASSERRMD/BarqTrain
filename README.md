@@ -11,6 +11,32 @@
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
 - **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
 
+## Current Status
+
+BarqTrain is already a useful native acceleration layer, but it is not yet a full native memory-management stack for LLM serving.
+
+| Area | Native Status Today | Primary Benefit Today | Biggest Missing Piece |
+|------|----------------------|-----------------------|-----------------------|
+| RMSNorm | CUDA kernel shipped | lower kernel overhead | deeper fusion into larger blocks |
+| Cross-entropy | CUDA chunked loss shipped | lower training memory and better training throughput | more fused projection-plus-loss work |
+| Data path | Rust packing shipped | lower Python overhead and less padding waste | padding-free end-to-end training path |
+| Attention | backend selection shipped | faster attention when FlashAttention is available | native KV-cache memory management |
+| Inference memory | partial | speed wins today | paged and quantized KV-cache |
+| Optimizer memory | wrapper-level | optional training-memory savings | native optimizer-state control |
+
+## Research-Backed Roadmap
+
+The next memory-focused work is tracked as a phased native implementation plan in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
+The roadmap is based on the most relevant public work for this problem space:
+
+- [FlashAttention-3](https://arxiv.org/abs/2407.08608)
+- [PagedAttention / vLLM](https://arxiv.org/abs/2309.06180)
+- [KIVI KV-cache quantization](https://arxiv.org/abs/2402.02750)
+- [Cut Cross Entropy](https://arxiv.org/abs/2411.09009)
+- [Padding-Free Transformer](https://huggingface.co/blog/mayank-mishra/padding-free-transformer)
+- [PyTorch activation checkpointing techniques](https://pytorch.org/blog/activation-checkpointing-techniques/)
+
 ## Installation
 
 ### Google Colab (NVIDIA GPU) 🚀
@@ -267,16 +293,21 @@ trainer.train()
 
 ## Performance
 
-BarqTrain achieves significant improvements over standard Hugging Face/PyTorch training:
+BarqTrain should be evaluated in two separate ways:
 
-| Optimization | Memory Savings | Speed Improvement |
-|--------------|----------------|-------------------|
-| Chunked Cross-Entropy | 40-60% VRAM | 1.2-1.5x throughput |
-| Fused RMSNorm | 5-10% VRAM | 1.1-1.3x per layer |
-| FlashAttention / SDPA backend selection | 20-30% VRAM | 1.5-2.0x attention |
-| Fused LoRA | Minimal | 1.1-1.2x adapter compute |
-| Rust sequence packing | Lower padding waste | 1.3-2.0x data loading |
-| Paged optimizer | Lower optimizer-state pressure | Model and workload dependent |
+- **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
+- **Inference path**: the current native stack already improves latency and tokens/sec, but total peak VRAM on short full-weight runs is still often dominated by model residency.
+
+That distinction matters. A faster inference benchmark does not automatically mean lower total VRAM if model weights remain the largest memory bucket.
+
+The roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
+
+1. native memory accounting
+2. paged KV-cache
+3. quantized KV-cache
+4. fused projection-plus-loss improvements
+5. padding-free packed training
+6. activation-memory control
 
 ## Architecture
 
