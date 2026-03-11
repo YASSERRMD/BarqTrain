@@ -69,6 +69,76 @@ def test_patch_model_skips_when_already_patched(monkeypatch):
     assert called["count"] == 1
 
 
+def test_preferred_attention_backend_prefers_flash_attention(monkeypatch):
+    patch_models._preferred_attention_backend.cache_clear()
+    monkeypatch.setattr(patch_models.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(patch_models.importlib.util, "find_spec", lambda name: object())
+
+    assert patch_models._preferred_attention_backend() == "flash_attention_2"
+
+
+def test_preferred_attention_backend_falls_back_to_sdpa(monkeypatch):
+    patch_models._preferred_attention_backend.cache_clear()
+    monkeypatch.setattr(patch_models.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(patch_models.importlib.util, "find_spec", lambda name: None)
+
+    assert patch_models._preferred_attention_backend() == "sdpa"
+
+
+def test_configure_attention_backend_updates_model_config(monkeypatch):
+    model = DummyModel(model_type="llama")
+    model.config.attn_implementation = None
+
+    monkeypatch.setattr(
+        patch_models,
+        "_preferred_attention_backend",
+        lambda: "flash_attention_2",
+    )
+
+    backend = patch_models._configure_attention_backend(model, "Llama")
+
+    assert backend == "flash_attention_2"
+    assert model.config._attn_implementation == "flash_attention_2"
+    assert model.config.attn_implementation == "flash_attention_2"
+
+
+@pytest.mark.parametrize(
+    "patch_fn_name,expected_label",
+    [
+        ("patch_llama", "Llama"),
+        ("patch_lfm2", "LFM2"),
+        ("patch_mistral", "Mistral/Mixtral"),
+        ("patch_deepseek", "DeepSeek"),
+        ("patch_phi", "Phi"),
+        ("patch_olmo", "OLMo"),
+        ("patch_granite", "Granite"),
+        ("patch_jamba", "Jamba"),
+        ("patch_llama4", "Llama4"),
+        ("patch_gemma", "Gemma"),
+        ("patch_qwen", "Qwen"),
+    ],
+)
+def test_patch_family_configures_attention_backend(monkeypatch, patch_fn_name, expected_label):
+    model = DummyModel(model_type="unknown")
+    called = {}
+
+    def _configure(model_arg, label):
+        called["label"] = label
+        return "sdpa"
+
+    monkeypatch.setattr(patch_models, "_configure_attention_backend", _configure)
+    monkeypatch.setattr(
+        patch_models,
+        "_patch_rmsnorm_targets",
+        lambda model_arg, target_specs: model_arg,
+    )
+
+    patched = getattr(patch_models, patch_fn_name)(model)
+
+    assert patched is model
+    assert called["label"] == expected_label
+
+
 def test_patch_model_routes_lfm2_by_model_type(monkeypatch):
     model = DummyModel(model_type="lfm2")
 

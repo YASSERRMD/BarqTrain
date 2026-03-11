@@ -6,9 +6,10 @@
 
 - **Fused RMSNorm**: Single-kernel normalization reducing HBM bandwidth by 3-4x
 - **Chunked Cross-Entropy**: Avoids logit materialization, saving up to 60% VRAM for large vocabularies
-- **FlashAttention with Fused RoPE**: Tiled attention computation with rotary position embeddings
+- **FlashAttention Integration**: `patch_model(...)` selects `flash_attention_2` when available and falls back to PyTorch SDPA otherwise
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
-- **Rust Data Pipeline**: Multi-threaded sequence packing with zero GIL contention
+- **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
+- **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
 
 ## Installation
 
@@ -159,23 +160,63 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 git clone https://github.com/YASSERRMD/BarqTrain.git
 cd BarqTrain
 
-# Install Python package (no compilation required)
+# Install Python package
 pip install -e .
-```
 
-Optional environment flags:
+# Optional: build Rust extension (requires Rust + maturin)
+cd rust
+maturin develop --release
+cd ..
 
 # Optional: build CUDA kernels (requires NVIDIA GPU + CUDA toolkit)
 BARQTRAIN_BUILD_CUDA=1 pip install -e .
+```
 
-# Optional: build via CMake directly
-cd csrc && mkdir build && cd build
-cmake ..        # auto-detects PyTorch cmake prefix
-make -j$(nproc)
+### Training Helpers
 
-# Optional: build Rust extension (requires Rust + maturin)
-cd ../../rust
-maturin develop --release
+BarqTrain exposes thin helpers for the optimized training path:
+
+- `patch_model(model)`: patches supported RMSNorm layers and configures the best attention backend available
+- `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
+- `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
+
+```python
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from barqtrain import (
+    PackedCausalLMDataCollator,
+    create_optimizer,
+    patch_model,
+)
+
+model_id = "Qwen/Qwen2-0.5B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(model_id)
+patch_model(model)
+
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:256]")
+
+def tokenize(batch):
+    return tokenizer(batch["text"], truncation=True, max_length=512, padding=False)
+
+tokenized = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+collator = PackedCausalLMDataCollator(
+    max_length=512,
+    pad_token_id=tokenizer.pad_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+)
+dataloader = DataLoader(tokenized, batch_size=4, shuffle=True, collate_fn=collator)
+
+optimizer = create_optimizer(
+    model.parameters(),
+    lr=1e-5,
+    optimizer_name="paged_adamw_32bit",
+)
 ```
 
 
@@ -216,9 +257,10 @@ BarqTrain achieves significant improvements over standard Hugging Face/PyTorch t
 |--------------|----------------|-------------------|
 | Chunked Cross-Entropy | 40-60% VRAM | 1.2-1.5x throughput |
 | Fused RMSNorm | 5-10% VRAM | 1.1-1.3x per layer |
-| FlashAttention | 20-30% VRAM | 1.5-2.0x attention |
+| FlashAttention / SDPA backend selection | 20-30% VRAM | 1.5-2.0x attention |
 | Fused LoRA | Minimal | 1.1-1.2x adapter compute |
-| Rust Data Pipeline | N/A | 1.3-2.0x data loading |
+| Rust sequence packing | Lower padding waste | 1.3-2.0x data loading |
+| Paged optimizer | Lower optimizer-state pressure | Model and workload dependent |
 
 ## Architecture
 
@@ -262,6 +304,13 @@ pytest tests/test_rmsnorm.py -v
 
 # Run benchmarks
 python -m barqtrain.benchmarks.baseline --model tinyllama --steps 100
+
+# Benchmark Rust packing + paged optimizer
+python -m barqtrain.benchmarks.baseline \
+  --model tinyllama \
+  --steps 100 \
+  --use-packing \
+  --optimizer paged_adamw_32bit
 ```
 
 ### Building Documentation
