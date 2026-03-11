@@ -211,6 +211,8 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             loss, grad_hidden, grad_lm_head = cuda_backend.chunked_cross_entropy(
                 hidden_states, lm_head_weight, labels
             )
+            grad_hidden = grad_hidden.to(hidden_states.dtype)
+            grad_lm_head = grad_lm_head.to(lm_head_weight.dtype)
             ctx.save_for_backward(grad_hidden, grad_lm_head)
             return loss
         else:
@@ -241,7 +243,13 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         cuda_backend = _get_cuda_backend()
         if cuda_backend is not None:
             grad_hidden, grad_lm_head = ctx.saved_tensors
-            return grad_hidden * grad_output, grad_lm_head * grad_output, None
+            grad_hidden_scale = grad_output.to(grad_hidden.dtype)
+            grad_lm_head_scale = grad_output.to(grad_lm_head.dtype)
+            return (
+                grad_hidden * grad_hidden_scale,
+                grad_lm_head * grad_lm_head_scale,
+                None,
+            )
         else:
             hidden_states, lm_head_weight, labels = ctx.saved_tensors
             with torch.enable_grad():

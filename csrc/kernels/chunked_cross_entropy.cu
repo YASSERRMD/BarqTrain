@@ -75,7 +75,9 @@ chunked_cross_entropy_impl(torch::Tensor hidden_states,
   for (int64_t start = 0; start < vocab_size; start += chunk_size) {
     const int64_t current_chunk = std::min<int64_t>(chunk_size, vocab_size - start);
     auto weight_chunk = weight_float.narrow(0, start, current_chunk);
-    auto logits_chunk = torch::matmul(hidden_flat, weight_chunk.transpose(0, 1));
+    // Keep the chunk accumulator in fp32 even under autocast-enabled training.
+    auto logits_chunk =
+        torch::matmul(hidden_flat, weight_chunk.transpose(0, 1)).to(torch::kFloat32);
     auto chunk_max = std::get<0>(logits_chunk.max(/*dim=*/1));
     global_max = torch::maximum(global_max, chunk_max);
   }
@@ -84,7 +86,8 @@ chunked_cross_entropy_impl(torch::Tensor hidden_states,
   for (int64_t start = 0; start < vocab_size; start += chunk_size) {
     const int64_t current_chunk = std::min<int64_t>(chunk_size, vocab_size - start);
     auto weight_chunk = weight_float.narrow(0, start, current_chunk);
-    auto logits_chunk = torch::matmul(hidden_flat, weight_chunk.transpose(0, 1));
+    auto logits_chunk =
+        torch::matmul(hidden_flat, weight_chunk.transpose(0, 1)).to(torch::kFloat32);
     logsumexp_acc +=
         torch::exp(logits_chunk - global_max.unsqueeze(1)).sum(/*dim=*/1);
 
@@ -116,7 +119,8 @@ chunked_cross_entropy_impl(torch::Tensor hidden_states,
   for (int64_t start = 0; start < vocab_size; start += chunk_size) {
     const int64_t current_chunk = std::min<int64_t>(chunk_size, vocab_size - start);
     auto weight_chunk = weight_float.narrow(0, start, current_chunk);
-    auto logits_chunk = torch::matmul(hidden_flat, weight_chunk.transpose(0, 1));
+    auto logits_chunk =
+        torch::matmul(hidden_flat, weight_chunk.transpose(0, 1)).to(torch::kFloat32);
     auto probs =
         torch::exp(logits_chunk - global_max.unsqueeze(1)) / logsumexp_acc.unsqueeze(1);
     probs *= active_mask_f.unsqueeze(1);

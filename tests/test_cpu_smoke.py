@@ -135,6 +135,33 @@ def test_ops_fallback_chunked_cross_entropy_backward():
     assert torch.isfinite(lm_head.grad).all()
 
 
+def test_chunked_cross_entropy_cuda_wrapper_preserves_input_grad_dtypes(monkeypatch):
+    """CUDA wrapper should cast backend gradients back to input dtypes."""
+    import barqtrain.ops as ops
+
+    class FakeCudaBackend:
+        @staticmethod
+        def chunked_cross_entropy(hidden_states, lm_head_weight, labels):
+            loss = torch.tensor(1.0, dtype=torch.float32)
+            grad_hidden = torch.ones_like(hidden_states, dtype=torch.float32)
+            grad_lm_head = torch.ones_like(lm_head_weight, dtype=torch.float32)
+            return loss, grad_hidden, grad_lm_head
+
+    monkeypatch.setattr(ops, "_get_cuda_backend", lambda: FakeCudaBackend())
+
+    hidden = torch.randn(2, 3, 4, dtype=torch.float16, requires_grad=True)
+    lm_head = torch.randn(8, 4, dtype=torch.float16, requires_grad=True)
+    labels = torch.randint(0, 8, (2, 3), dtype=torch.long)
+
+    loss = ops.chunked_cross_entropy_loss(hidden, lm_head, labels)
+    loss.backward()
+
+    assert hidden.grad is not None
+    assert lm_head.grad is not None
+    assert hidden.grad.dtype == hidden.dtype
+    assert lm_head.grad.dtype == lm_head.dtype
+
+
 def test_patch_model_generic():
     """patch_model returns the model unchanged for generic models."""
     from barqtrain import patch_model
