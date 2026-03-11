@@ -142,7 +142,7 @@ fn pack_sequences(sequences: Vec<Vec<u32>>, max_len: usize) -> PyResult<Vec<Pack
             } else {
                 let position_ids: Vec<u64> = (0..seq_len as u64).collect();
                 batches.push(PackedBatch {
-                    input_ids: seq.clone(),
+                    input_ids: seq,
                     attention_mask: vec![1u8; seq_len],
                     sequence_ids: vec![orig_idx as i64; seq_len],
                     position_ids,
@@ -168,13 +168,13 @@ fn flush_causal_lm_batch(
 
     let seq_len = current_tokens.len();
     if drop_remainder && seq_len < max_length {
-        current_tokens.clear();
+        *current_tokens = Vec::with_capacity(max_length);
         return;
     }
 
-    let mut input_ids = current_tokens.clone();
+    let mut input_ids = std::mem::replace(current_tokens, Vec::with_capacity(max_length));
     let mut attention_mask = vec![1u8; seq_len];
-    let mut labels: Vec<i64> = current_tokens.iter().map(|token| *token as i64).collect();
+    let mut labels: Vec<i64> = input_ids.iter().map(|token| *token as i64).collect();
 
     if seq_len < max_length {
         input_ids.resize(max_length, pad_token_id);
@@ -187,7 +187,6 @@ fn flush_causal_lm_batch(
         attention_mask,
         labels,
     });
-    current_tokens.clear();
 }
 
 /// Pack tokenized sequences into fixed-length causal LM blocks.
@@ -210,18 +209,32 @@ fn pack_for_causal_lm(
     }
 
     let eos_token_id = eos_token_id.unwrap_or(pad_token_id);
-    let mut packed_batches: Vec<PackedCausalLMBatch> = Vec::new();
+    let prepared_sequences: Vec<Vec<u32>> = sequences
+        .into_par_iter()
+        .filter_map(|mut sequence| {
+            if sequence.is_empty() {
+                return None;
+            }
+
+            if sequence.last().copied() != Some(eos_token_id) {
+                sequence.push(eos_token_id);
+            }
+            Some(sequence)
+        })
+        .collect();
+
+    let total_tokens: usize = prepared_sequences.par_iter().map(Vec::len).sum();
+    let estimated_batches = if drop_remainder {
+        total_tokens / max_length
+    } else {
+        (total_tokens + max_length.saturating_sub(1)) / max_length
+    };
+
+    let mut packed_batches: Vec<PackedCausalLMBatch> =
+        Vec::with_capacity(estimated_batches.max(1));
     let mut current_tokens: Vec<u32> = Vec::with_capacity(max_length);
 
-    for mut sequence in sequences {
-        if sequence.is_empty() {
-            continue;
-        }
-
-        if sequence.last().copied() != Some(eos_token_id) {
-            sequence.push(eos_token_id);
-        }
-
+    for sequence in prepared_sequences {
         let mut cursor = 0usize;
         while cursor < sequence.len() {
             let remaining = max_length - current_tokens.len();
