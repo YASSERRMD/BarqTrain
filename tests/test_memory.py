@@ -53,6 +53,17 @@ def test_preferred_last_token_logits_kwarg_returns_none_when_unsupported():
     assert preferred_last_token_logits_kwarg(DummyModel()) is None
 
 
+def test_preferred_last_token_logits_kwarg_uses_generation_mixin_capability():
+    class DummyModel(torch.nn.Module):
+        def _supports_logits_to_keep(self):
+            return True
+
+        def forward(self, input_ids=None):
+            return input_ids
+
+    assert preferred_last_token_logits_kwarg(DummyModel()) == "logits_to_keep"
+
+
 def test_build_generation_kwargs_uses_generation_config_copy():
     class DummyModel(torch.nn.Module):
         def __init__(self):

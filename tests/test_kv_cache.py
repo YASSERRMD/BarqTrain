@@ -64,6 +64,7 @@ def test_create_paged_kv_cache_uses_decoder_layer_count():
 
 def test_maybe_prepare_paged_kv_generate_kwargs_injects_cache(monkeypatch):
     monkeypatch.setattr("barqtrain.kv_cache._get_cuda_backend", lambda: object())
+    monkeypatch.setenv("BARQTRAIN_PAGED_KV_MIN_CACHE_LEN", "0")
 
     model = types.SimpleNamespace(
         config=DummyConfig(),
@@ -83,6 +84,27 @@ def test_maybe_prepare_paged_kv_generate_kwargs_injects_cache(monkeypatch):
     assert isinstance(updated_kwargs["past_key_values"], BarqPagedKVCache)
     assert updated_kwargs["past_key_values"].barqtrain_max_batch_size == 2
     assert updated_kwargs["past_key_values"].barqtrain_max_cache_len == 12
+
+
+def test_maybe_prepare_paged_kv_generate_kwargs_skips_short_decode(monkeypatch):
+    monkeypatch.setattr("barqtrain.kv_cache._get_cuda_backend", lambda: object())
+    monkeypatch.setenv("BARQTRAIN_PAGED_KV_MIN_CACHE_LEN", "256")
+
+    model = types.SimpleNamespace(
+        config=DummyConfig(),
+        generation_config=types.SimpleNamespace(max_new_tokens=None, max_length=32),
+        _barqtrain_paged_kv_supported=True,
+    )
+    fake_input_ids = types.SimpleNamespace(shape=(1, 32), device=torch.device("cuda"))
+
+    updated_kwargs, used = maybe_prepare_paged_kv_generate_kwargs(
+        model,
+        (),
+        {"input_ids": fake_input_ids, "max_new_tokens": 16},
+    )
+
+    assert used is False
+    assert "past_key_values" not in updated_kwargs
 
 
 def test_patch_generate_with_paged_kv_records_usage(monkeypatch):
