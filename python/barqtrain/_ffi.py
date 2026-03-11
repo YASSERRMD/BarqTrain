@@ -25,6 +25,7 @@ _CUDA_SOURCES = (
     _PROJECT_ROOT / "csrc" / "kernels" / "flash_attention.cu",
     _PROJECT_ROOT / "csrc" / "kernels" / "chunked_cross_entropy.cu",
     _PROJECT_ROOT / "csrc" / "kernels" / "lora.cu",
+    _PROJECT_ROOT / "csrc" / "kernels" / "paged_kv_cache.cu",
 )
 _CUDA_BACKEND: Optional[ModuleType] = None
 _RUST_BACKEND: Optional[ModuleType] = None
@@ -80,6 +81,26 @@ def _detect_cuda_home() -> Optional[str]:
     return None
 
 
+def _ensure_torch_cuda_arch_list() -> None:
+    if os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        return
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+            return
+    except Exception:
+        pass
+
+    os.environ["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
+        "BARQTRAIN_CUDA_ARCH_LIST",
+        "7.5",
+    )
+
+
 def load_cuda_backend() -> Optional[ModuleType]:
     """
     Load the CUDA backend module.
@@ -125,6 +146,7 @@ def load_cuda_backend() -> Optional[ModuleType]:
     if cuda_home:
         os.environ.setdefault("CUDA_HOME", cuda_home)
         cpp_extension.CUDA_HOME = cuda_home
+        _ensure_torch_cuda_arch_list()
     elif cpp_extension.CUDA_HOME is not None:
         cuda_home = cpp_extension.CUDA_HOME
 

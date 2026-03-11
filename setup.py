@@ -50,6 +50,26 @@ def _detect_cuda_home(initial_cuda_home=None):
 
     return None
 
+
+def _ensure_torch_cuda_arch_list():
+    if os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        return
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+            return
+    except Exception:
+        pass
+
+    os.environ["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
+        "BARQTRAIN_CUDA_ARCH_LIST",
+        "7.5",
+    )
+
 try:
     from setuptools_rust import Binding, RustExtension
 
@@ -80,6 +100,7 @@ if os.environ.get("BARQTRAIN_BUILD_CUDA"):
         if cuda_home:
             os.environ.setdefault("CUDA_HOME", cuda_home)
             cpp_extension.CUDA_HOME = cuda_home
+            _ensure_torch_cuda_arch_list()
 
         if cuda_home and Path("csrc").exists():
             _sources = [s for s in [
@@ -88,6 +109,7 @@ if os.environ.get("BARQTRAIN_BUILD_CUDA"):
                 "csrc/kernels/flash_attention.cu",
                 "csrc/kernels/chunked_cross_entropy.cu",
                 "csrc/kernels/lora.cu",
+                "csrc/kernels/paged_kv_cache.cu",
             ] if Path(s).exists()]
 
             if _sources:

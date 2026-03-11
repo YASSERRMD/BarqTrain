@@ -40,6 +40,14 @@ torch::Tensor fused_lora_forward_cuda(
     float scaling
 );
 
+void paged_kv_append_cuda(
+    torch::Tensor key_cache,
+    torch::Tensor value_cache,
+    torch::Tensor seq_lens,
+    torch::Tensor key_states,
+    torch::Tensor value_states
+);
+
 // Python module definition
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "BarqTrain CUDA kernels for high-performance LLM fine-tuning";
@@ -61,4 +69,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // LoRA functions
     m.def("fused_lora_forward", &fused_lora_forward_cuda,
           "Fused LoRA forward: x @ W_base + (x @ A) @ B (CUDA)");
+
+    // KV-cache functions
+    m.def("paged_kv_append_", &paged_kv_append_cuda,
+          "Append key/value states into the paged KV cache (CUDA)");
 }

@@ -44,6 +44,7 @@ from barqtrain.memory import (
     cuda_memory_snapshot,
     generation_overhead_mb,
 )
+from barqtrain.kv_cache import BarqPagedKVCache, create_paged_kv_cache
 from barqtrain.optim import create_optimizer
 
 __all__ = [
@@ -65,6 +66,8 @@ __all__ = [
     "cuda_memory_snapshot",
     "generation_overhead_mb",
     "build_generation_kwargs",
+    "BarqPagedKVCache",
+    "create_paged_kv_cache",
     "create_optimizer",
     "__version__",
 ]
