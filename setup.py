@@ -3,7 +3,7 @@ BarqTrain setup.py
 
 All Python package metadata is in pyproject.toml.
 This file adds the optional CUDA extension when BARQTRAIN_BUILD_CUDA=1 and
-builds the Rust extension when setuptools-rust and a Rust toolchain are available.
+always builds the Rust extension during install/editable install.
 setup() is ALWAYS called so pip can gather editable install metadata.
 """
 
@@ -15,12 +15,6 @@ from setuptools import setup
 _cuda_ext = None
 _build_ext_cls = {}
 _rust_extensions = []
-_rust_optional = os.environ.get("BARQTRAIN_OPTIONAL_RUST", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 
 def _detect_cuda_home(initial_cuda_home=None):
@@ -66,11 +60,16 @@ try:
                 path="rust/Cargo.toml",
                 binding=Binding.PyO3,
                 debug=False,
-                optional=_rust_optional,
+                optional=False,
             )
         )
 except Exception as e:
-    print(f"Warning: Rust extension skipped: {e}")
+    raise RuntimeError(
+        "BarqTrain requires the Rust extension to be configured during build. "
+        "Install with `pip install -e .` after installing a Rust toolchain. "
+        "Use `BARQTRAIN_BUILD_CUDA=1 pip install -e . --no-build-isolation` "
+        f"afterwards when you need the CUDA extension. Original error: {e}"
+    ) from e
 
 if os.environ.get("BARQTRAIN_BUILD_CUDA"):
     try:
