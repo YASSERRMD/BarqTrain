@@ -81,9 +81,34 @@ from barqtrain import patch_model
 print(f"BarqTrain {barqtrain.__version__} loaded ✓")
 ```
 
-> **⚠️ Note:** If you restart the Colab runtime, just re-run this cell.
+**Step 3 — Restart the Colab runtime/session**
 
-**Step 3 — (Optional) Compile CUDA kernels for maximum performance**
+After the native Rust/CUDA build, restart the runtime before training or benchmarking.
+
+`Runtime -> Restart session`
+
+**Step 4 — Verify native runtime loading after restart**
+
+```python
+%cd /content/BarqTrain
+import sys, importlib, importlib.util
+sys.path.insert(0, "/content/BarqTrain/python")
+importlib.invalidate_caches()
+
+import barqtrain
+import barqtrain._ffi as ffi
+
+print("barqtrain_rs spec:", bool(importlib.util.find_spec("barqtrain_rs")))
+print("barqtrain_cuda spec:", bool(importlib.util.find_spec("barqtrain_cuda")))
+print("rust runtime load:", ffi.load_rust_backend() is not None)
+print("cuda runtime load:", ffi.load_cuda_backend() is not None)
+
+assert ffi.load_rust_backend() is not None
+assert ffi.load_cuda_backend() is not None
+print(f"BarqTrain {barqtrain.__version__} runtime verification: OK")
+```
+
+**Step 5 — (Optional) Compile CUDA kernels for maximum performance**
 
 The CUDA kernels give the biggest speedups. Compilation takes ~2 min on Colab.
 
@@ -190,7 +215,7 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
   <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_training_inference_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 - Benchmark Comparison (`examples/barqtrain_benchmark_comparison_colab.ipynb`):
   <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_benchmark_comparison_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
-  Both notebooks fail fast if `barqtrain_rs` or `barqtrain_cuda` do not load. The benchmark notebook compares only baseline HF, compiled BarqTrain CUDA, and full-weight Unsloth.
+  Both notebooks now make the post-build restart explicit and include a runtime verification step for `barqtrain_rs` and `barqtrain_cuda`.
 
 ### Local (from source)
 
@@ -223,6 +248,7 @@ BARQTRAIN_CUDA_ARCH_LIST=7.5 BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . -
 BarqTrain exposes thin helpers for the optimized training path:
 
 - `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through chunked loss, and wraps compatible CUDA generation calls to inject BarqTrain's paged KV cache automatically
+- `patch_inference(model)`: inference-only patching path for decode benchmarks and low-memory generation experiments
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
 - `create_paged_kv_cache(...)`: explicitly create a paged KV cache when you want to control decode capacity yourself
@@ -274,12 +300,12 @@ For explicit decode-cache control, you can create and pass a paged KV cache your
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from barqtrain import create_paged_kv_cache, patch_model
+from barqtrain import create_paged_kv_cache, patch_inference
 
 model_id = "Qwen/Qwen2-0.5B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).cuda()
-patch_model(model)
+patch_inference(model)
 
 inputs = tokenizer("Explain paged KV caches.", return_tensors="pt").to("cuda")
 cache = create_paged_kv_cache(model, max_batch_size=1, max_cache_len=256, page_size=16)
@@ -325,11 +351,17 @@ BarqTrain should be evaluated in two separate ways:
 
 That distinction matters. A faster inference benchmark does not automatically mean lower total VRAM if model weights remain the largest memory bucket.
 
-The current inference benchmark should be read using three numbers together:
+The current inference benchmark now runs two profiles:
+
+1. `throughput_short`: short prompt + short decode
+2. `memory_long`: long prompt + longer decode to stress KV-cache growth
+
+The current inference benchmark should be read using these numbers together:
 
 1. `resident_vram_mb`: memory already committed before decode
 2. `generation_overhead_mb`: memory added by decode-time work
 3. `paged_kv_cache`: whether BarqTrain's paged cache path was actually active
+4. `last_token_logits_only`: whether decode-token logits-only generation was requested
 
 The roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
