@@ -8,12 +8,47 @@ setup() is ALWAYS called so pip can gather editable install metadata.
 """
 
 import os
+import shutil
 from pathlib import Path
 from setuptools import setup
 
 _cuda_ext = None
 _build_ext_cls = {}
 _rust_extensions = []
+
+
+def _detect_cuda_home(initial_cuda_home=None):
+    if initial_cuda_home and Path(initial_cuda_home).exists():
+        return initial_cuda_home
+
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_home = os.environ.get(env_name)
+        if cuda_home and Path(cuda_home).exists():
+            return cuda_home
+
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return str(Path(nvcc).resolve().parents[1])
+
+    try:
+        import torch
+
+        if torch.version.cuda:
+            version = torch.version.cuda
+            for candidate in (
+                f"/usr/local/cuda-{version}",
+                f"/usr/local/cuda-{version.split('.')[0]}",
+            ):
+                if Path(candidate).exists():
+                    return candidate
+    except Exception:
+        pass
+
+    for candidate in ("/usr/local/cuda", "/opt/cuda"):
+        if Path(candidate).exists():
+            return candidate
+
+    return None
 
 try:
     from setuptools_rust import Binding, RustExtension
@@ -33,9 +68,15 @@ except Exception as e:
 
 if os.environ.get("BARQTRAIN_BUILD_CUDA"):
     try:
+        import torch.utils.cpp_extension as cpp_extension
         from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
-        if CUDA_HOME and Path("csrc").exists():
+        cuda_home = _detect_cuda_home(CUDA_HOME)
+        if cuda_home:
+            os.environ.setdefault("CUDA_HOME", cuda_home)
+            cpp_extension.CUDA_HOME = cuda_home
+
+        if cuda_home and Path("csrc").exists():
             _sources = [s for s in [
                 "csrc/src/bindings.cpp",
                 "csrc/kernels/rmsnorm.cu",
@@ -54,6 +95,8 @@ if os.environ.get("BARQTRAIN_BUILD_CUDA"):
                     },
                 )
                 _build_ext_cls = {"build_ext": BuildExtension}
+        else:
+            print("Warning: CUDA extension skipped: CUDA toolkit not found")
     except Exception as e:
         print(f"Warning: CUDA extension skipped: {e}")
 
