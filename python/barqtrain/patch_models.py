@@ -6,8 +6,10 @@ with BarqTrain's optimized CUDA kernels and Rust operations.
 """
 
 import importlib
+import importlib.util
 import types
 from functools import lru_cache
+from typing import Optional
 
 import torch
 
@@ -21,6 +23,39 @@ def _apply_patch_once(model: torch.nn.Module, patch_fn) -> torch.nn.Module:
     patched_model = patch_fn(model)
     setattr(patched_model, "_barqtrain_model_patched", True)
     return patched_model
+
+
+@lru_cache(maxsize=1)
+def _preferred_attention_backend() -> Optional[str]:
+    """
+    Pick the fastest attention backend available in the current environment.
+    """
+    if torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None:
+        return "flash_attention_2"
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        return "sdpa"
+    return None
+
+
+def _configure_attention_backend(model: torch.nn.Module, model_label: str) -> Optional[str]:
+    """
+    Configure the model to use FlashAttention or SDPA when available.
+    """
+    config = getattr(model, "config", None)
+    backend = _preferred_attention_backend()
+    if config is None or backend is None:
+        return None
+
+    current_backend = getattr(config, "_attn_implementation", None)
+    if current_backend == backend:
+        return backend
+
+    setattr(config, "_attn_implementation", backend)
+    if hasattr(config, "attn_implementation"):
+        setattr(config, "attn_implementation", backend)
+
+    print(f"BarqTrain: Enabled {backend} attention backend for {model_label}")
+    return backend
 
 
 @lru_cache(maxsize=256)
@@ -230,6 +265,7 @@ def patch_llama(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
+    _configure_attention_backend(model, "Llama")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -259,6 +295,7 @@ def patch_lfm2(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
+    _configure_attention_backend(model, "LFM2")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -288,6 +325,7 @@ def patch_mistral(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
+    _configure_attention_backend(model, "Mistral/Mixtral")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -320,6 +358,7 @@ def patch_deepseek(model: torch.nn.Module) -> torch.nn.Module:
     Replaces:
     - RMSNorm with fused RMSNorm kernel
     """
+    _configure_attention_backend(model, "DeepSeek")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -352,6 +391,7 @@ def patch_phi(model: torch.nn.Module) -> torch.nn.Module:
     Replaces:
     - RMSNorm with fused RMSNorm kernel
     """
+    _configure_attention_backend(model, "Phi")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -384,6 +424,7 @@ def patch_olmo(model: torch.nn.Module) -> torch.nn.Module:
     Replaces:
     - RMSNorm with fused RMSNorm kernel
     """
+    _configure_attention_backend(model, "OLMo")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -416,6 +457,7 @@ def patch_granite(model: torch.nn.Module) -> torch.nn.Module:
     Replaces:
     - RMSNorm with fused RMSNorm kernel
     """
+    _configure_attention_backend(model, "Granite")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -439,6 +481,7 @@ def patch_jamba(model: torch.nn.Module) -> torch.nn.Module:
     Replaces:
     - RMSNorm with fused RMSNorm kernel
     """
+    _configure_attention_backend(model, "Jamba")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -462,6 +505,7 @@ def patch_llama4(model: torch.nn.Module) -> torch.nn.Module:
     Replaces:
     - RMSNorm with fused RMSNorm kernel
     """
+    _configure_attention_backend(model, "Llama4")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -493,6 +537,7 @@ def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
+    _configure_attention_backend(model, "Gemma")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -546,6 +591,7 @@ def patch_qwen(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
+    _configure_attention_backend(model, "Qwen")
     return _patch_rmsnorm_targets(
         model,
         [
