@@ -97,6 +97,44 @@ def test_ops_fallback_chunked_cross_entropy():
     assert torch.isfinite(loss)
 
 
+def test_ops_fallback_chunked_cross_entropy_matches_torch_ignore_index():
+    """CPU fallback should honor ignore_index and match PyTorch numerically."""
+    from barqtrain.ops import chunked_cross_entropy_loss
+
+    hidden = torch.randn(2, 4, 16, requires_grad=True)
+    lm_head = torch.randn(32, 16, requires_grad=True)
+    labels = torch.randint(0, 32, (2, 4))
+    labels[0, 1] = -100
+
+    bt_loss = chunked_cross_entropy_loss(hidden, lm_head, labels)
+    torch_loss = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(hidden, lm_head).view(-1, lm_head.size(0)),
+        labels.view(-1),
+        reduction="mean",
+        ignore_index=-100,
+    )
+
+    assert torch.allclose(bt_loss, torch_loss, rtol=1e-5, atol=1e-6)
+
+
+def test_ops_fallback_chunked_cross_entropy_backward():
+    """CPU fallback should propagate gradients to hidden states and lm_head."""
+    from barqtrain.ops import chunked_cross_entropy_loss
+
+    hidden = torch.randn(2, 4, 16, requires_grad=True)
+    lm_head = torch.randn(32, 16, requires_grad=True)
+    labels = torch.randint(0, 32, (2, 4))
+    labels[1, 2] = -100
+
+    loss = chunked_cross_entropy_loss(hidden, lm_head, labels)
+    loss.backward()
+
+    assert hidden.grad is not None
+    assert lm_head.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+    assert torch.isfinite(lm_head.grad).all()
+
+
 def test_patch_model_generic():
     """patch_model returns the model unchanged for generic models."""
     from barqtrain import patch_model

@@ -131,6 +131,107 @@ def _patch_rmsnorm_resolved_targets(
     return model
 
 
+def _patch_causal_lm_chunked_loss(
+    model: torch.nn.Module,
+    model_label: str,
+) -> torch.nn.Module:
+    """
+    Patch compatible decoder-only CausalLM models to use chunked loss during training.
+    """
+    if getattr(model, "_barqtrain_chunked_loss_patched", False):
+        return model
+
+    if not hasattr(model, "model") or not hasattr(model, "lm_head"):
+        return model
+
+    try:
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+    except ImportError:
+        return model
+
+    original_forward = model.forward
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs,
+    ):
+        use_return_dict = (
+            return_dict if return_dict is not None else getattr(self.config, "use_return_dict", True)
+        )
+        use_chunked_loss = (
+            labels is not None
+            and self.training
+            and use_return_dict
+            and getattr(self, "_barqtrain_chunked_loss_enabled", True)
+            and past_key_values is None
+        )
+
+        if not use_chunked_loss:
+            return original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
+
+        from barqtrain.ops import chunked_cross_entropy_loss
+
+        model_outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
+
+        hidden_states = getattr(model_outputs, "last_hidden_state", None)
+        if hidden_states is None:
+            hidden_states = model_outputs[0]
+
+        shift_hidden_states = hidden_states[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = chunked_cross_entropy_loss(
+            shift_hidden_states,
+            self.lm_head.weight,
+            shift_labels,
+        )
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=None,
+            past_key_values=getattr(model_outputs, "past_key_values", None),
+            hidden_states=getattr(model_outputs, "hidden_states", None),
+            attentions=getattr(model_outputs, "attentions", None),
+        )
+
+    model.forward = types.MethodType(forward, model)
+    setattr(model, "_barqtrain_chunked_loss_patched", True)
+    print(f"BarqTrain: Enabled chunked loss patch for {model_label}")
+    return model
+
+
 def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     """
     Patch a Hugging Face model with BarqTrain optimizations.
@@ -266,6 +367,7 @@ def patch_llama(model: torch.nn.Module) -> torch.nn.Module:
         The patched model
     """
     _configure_attention_backend(model, "Llama")
+    model = _patch_causal_lm_chunked_loss(model, "Llama")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -296,6 +398,7 @@ def patch_lfm2(model: torch.nn.Module) -> torch.nn.Module:
         The patched model
     """
     _configure_attention_backend(model, "LFM2")
+    model = _patch_causal_lm_chunked_loss(model, "LFM2")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -326,6 +429,7 @@ def patch_mistral(model: torch.nn.Module) -> torch.nn.Module:
         The patched model
     """
     _configure_attention_backend(model, "Mistral/Mixtral")
+    model = _patch_causal_lm_chunked_loss(model, "Mistral/Mixtral")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -359,6 +463,7 @@ def patch_deepseek(model: torch.nn.Module) -> torch.nn.Module:
     - RMSNorm with fused RMSNorm kernel
     """
     _configure_attention_backend(model, "DeepSeek")
+    model = _patch_causal_lm_chunked_loss(model, "DeepSeek")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -392,6 +497,7 @@ def patch_phi(model: torch.nn.Module) -> torch.nn.Module:
     - RMSNorm with fused RMSNorm kernel
     """
     _configure_attention_backend(model, "Phi")
+    model = _patch_causal_lm_chunked_loss(model, "Phi")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -425,6 +531,7 @@ def patch_olmo(model: torch.nn.Module) -> torch.nn.Module:
     - RMSNorm with fused RMSNorm kernel
     """
     _configure_attention_backend(model, "OLMo")
+    model = _patch_causal_lm_chunked_loss(model, "OLMo")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -458,6 +565,7 @@ def patch_granite(model: torch.nn.Module) -> torch.nn.Module:
     - RMSNorm with fused RMSNorm kernel
     """
     _configure_attention_backend(model, "Granite")
+    model = _patch_causal_lm_chunked_loss(model, "Granite")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -482,6 +590,7 @@ def patch_jamba(model: torch.nn.Module) -> torch.nn.Module:
     - RMSNorm with fused RMSNorm kernel
     """
     _configure_attention_backend(model, "Jamba")
+    model = _patch_causal_lm_chunked_loss(model, "Jamba")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -506,6 +615,7 @@ def patch_llama4(model: torch.nn.Module) -> torch.nn.Module:
     - RMSNorm with fused RMSNorm kernel
     """
     _configure_attention_backend(model, "Llama4")
+    model = _patch_causal_lm_chunked_loss(model, "Llama4")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -538,6 +648,7 @@ def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
         The patched model
     """
     _configure_attention_backend(model, "Gemma")
+    model = _patch_causal_lm_chunked_loss(model, "Gemma")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -592,6 +703,7 @@ def patch_qwen(model: torch.nn.Module) -> torch.nn.Module:
         The patched model
     """
     _configure_attention_backend(model, "Qwen")
+    model = _patch_causal_lm_chunked_loss(model, "Qwen")
     return _patch_rmsnorm_targets(
         model,
         [

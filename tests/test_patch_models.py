@@ -69,6 +69,114 @@ def test_patch_model_skips_when_already_patched(monkeypatch):
     assert called["count"] == 1
 
 
+def test_patch_causal_lm_chunked_loss_uses_barqtrain_loss(monkeypatch):
+    class TinyBackbone(torch.nn.Module):
+        def __init__(self, hidden_size):
+            super().__init__()
+            self.embed = torch.nn.Embedding(32, hidden_size)
+
+        def forward(self, input_ids=None, **kwargs):
+            hidden = self.embed(input_ids)
+            return SimpleNamespace(
+                last_hidden_state=hidden,
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+            )
+
+    class TinyCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+                use_return_dict=True,
+            )
+            self.model = TinyBackbone(hidden_size=8)
+            self.lm_head = torch.nn.Linear(8, 32, bias=False)
+            self.original_forward_calls = 0
+
+        def forward(self, input_ids=None, labels=None, **kwargs):
+            self.original_forward_calls += 1
+            hidden = self.model(input_ids=input_ids).last_hidden_state
+            logits = self.lm_head(hidden)
+            loss = None
+            if labels is not None:
+                loss = torch.nn.functional.cross_entropy(
+                    logits[..., :-1, :].reshape(-1, logits.size(-1)),
+                    labels[..., 1:].reshape(-1),
+                )
+            return SimpleNamespace(loss=loss, logits=logits)
+
+    model = TinyCausalLM().train()
+    called = {"count": 0}
+
+    def fake_chunked_loss(hidden_states, lm_head_weight, labels):
+        called["count"] += 1
+        assert hidden_states.shape == (2, 3, 8)
+        assert labels.shape == (2, 3)
+        return hidden_states.sum() * 0 + lm_head_weight.sum() * 0
+
+    monkeypatch.setattr(
+        "barqtrain.ops.chunked_cross_entropy_loss",
+        fake_chunked_loss,
+    )
+
+    patch_models.patch_llama(model)
+    outputs = model(
+        input_ids=torch.randint(0, 32, (2, 4)),
+        labels=torch.randint(0, 32, (2, 4)),
+    )
+
+    assert called["count"] == 1
+    assert outputs.loss is not None
+    assert model.original_forward_calls == 0
+
+
+def test_patch_causal_lm_chunked_loss_skips_eval(monkeypatch):
+    class TinyBackbone(torch.nn.Module):
+        def __init__(self, hidden_size):
+            super().__init__()
+            self.embed = torch.nn.Embedding(32, hidden_size)
+
+        def forward(self, input_ids=None, **kwargs):
+            hidden = self.embed(input_ids)
+            return SimpleNamespace(
+                last_hidden_state=hidden,
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+            )
+
+    class TinyCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+                use_return_dict=True,
+            )
+            self.model = TinyBackbone(hidden_size=8)
+            self.lm_head = torch.nn.Linear(8, 32, bias=False)
+            self.original_forward_calls = 0
+
+        def forward(self, input_ids=None, labels=None, **kwargs):
+            self.original_forward_calls += 1
+            hidden = self.model(input_ids=input_ids).last_hidden_state
+            logits = self.lm_head(hidden)
+            return SimpleNamespace(loss=None, logits=logits)
+
+    model = TinyCausalLM().eval()
+
+    patch_models.patch_llama(model)
+    _ = model(
+        input_ids=torch.randint(0, 32, (2, 4)),
+        labels=torch.randint(0, 32, (2, 4)),
+    )
+
+    assert model.original_forward_calls == 1
+
+
 def test_preferred_attention_backend_prefers_flash_attention(monkeypatch):
     patch_models._preferred_attention_backend.cache_clear()
     monkeypatch.setattr(patch_models.torch.cuda, "is_available", lambda: True)
