@@ -207,23 +207,22 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         """
         cuda_backend = _get_cuda_backend()
         if cuda_backend is not None:
-            # Use CUDA kernel
-            losses, grad_hidden = cuda_backend.chunked_cross_entropy(
+            # Use chunked CUDA implementation that avoids full logits materialization.
+            loss, grad_hidden, grad_lm_head = cuda_backend.chunked_cross_entropy(
                 hidden_states, lm_head_weight, labels
             )
-            ctx.save_for_backward(hidden_states, lm_head_weight, labels, grad_hidden)
-            return losses.mean()
+            ctx.save_for_backward(grad_hidden, grad_lm_head)
+            return loss
         else:
             if hidden_states.is_cuda:
                 _warn_cuda_fallback_once()
-            # Fallback to PyTorch implementation
-            # Compute logits: [batch, seq_len, vocab_size]
+            # Fallback to PyTorch autograd for correctness.
             logits = torch.nn.functional.linear(hidden_states, lm_head_weight)
-            # Compute cross-entropy loss
             loss = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
                 reduction="mean",
+                ignore_index=-100,
             )
             ctx.save_for_backward(hidden_states, lm_head_weight, labels)
             return loss
@@ -241,25 +240,26 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
         """
         cuda_backend = _get_cuda_backend()
         if cuda_backend is not None:
-            # Use pre-computed gradient from CUDA kernel
-            _, _, labels, grad_hidden = ctx.saved_tensors
-            return grad_hidden * grad_output, None, None
-        else:
-            # Fallback to PyTorch implementation
-            hidden_states, lm_head_weight, labels = ctx.saved_tensors
-
-            # Recompute logits
-            logits = torch.nn.functional.linear(hidden_states, lm_head_weight)
-
-            # Compute gradients
-            # This is a simplified backward; in practice you'd use the full autograd
-            grad_logits = torch.nn.functional.one_hot(labels.view(-1), logits.size(-1)).float()
-            grad_logits = grad_logits.view_as(logits) - torch.softmax(logits, dim=-1).detach()
-
-            grad_hidden = grad_logits @ lm_head_weight
-            grad_lm_head = grad_logits.transpose(-2, -1) @ hidden_states
-
+            grad_hidden, grad_lm_head = ctx.saved_tensors
             return grad_hidden * grad_output, grad_lm_head * grad_output, None
+        else:
+            hidden_states, lm_head_weight, labels = ctx.saved_tensors
+            with torch.enable_grad():
+                hidden_states_re = hidden_states.detach().requires_grad_(True)
+                lm_head_re = lm_head_weight.detach().requires_grad_(True)
+                logits = torch.nn.functional.linear(hidden_states_re, lm_head_re)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    reduction="mean",
+                    ignore_index=-100,
+                )
+                grad_hidden, grad_lm_head = torch.autograd.grad(
+                    loss,
+                    (hidden_states_re, lm_head_re),
+                    grad_outputs=grad_output,
+                )
+            return grad_hidden, grad_lm_head, None
 
 
 def chunked_cross_entropy_loss(
