@@ -1,216 +1,265 @@
-# BarqTrain: High-Performance LLM Fine-Tuning Accelerator
+# BarqTrain Research-Based Implementation Plan
 
-**BarqTrain** is a high-performance fine-tuning library designed to bypass the memory and compute bottlenecks of standard Hugging Face/PyTorch training. By combining **Rust** for GIL-free data pipelines, **CUDA C++** for custom fused kernels, and **Python** for the user-facing API, BarqTrain achieves massive speedups and memory reductions similar to Unsloth and Liger Kernel.
+BarqTrain already ships native CUDA kernels for RMSNorm and chunked cross-entropy, plus a Rust-backed data path for sequence packing. The current bottleneck is different: inference speed is improved, but peak VRAM during short-context full-weight generation is still dominated by model residency rather than BarqTrain's temporary buffers.
 
----
+This plan turns the project into a native memory-and-throughput stack in phased, measurable steps.
 
-## 1. Core Technical Bottlenecks & BarqTrain Solutions
+## Objective
 
-Standard fine-tuning is memory-bandwidth-bound. BarqTrain solves this by attacking 6 specific inefficiencies:
+Build BarqTrain into a native accelerator that improves all three of the following at the same time:
 
-1. **Attention Memory & Bandwidth:** Standard attention materializes O(N^2) matrices in HBM. 
-   * **Solution:** Implement a custom CUDA C++ fused FlashAttention-3 kernel (using CUTLASS) with a tiled backward pass that avoids FP32 atomics.
-2. **Cross-Entropy Loss Logit Materialization:** Large vocabularies (e.g., 128K for Llama 3) cause massive OOMs by materializing the `[batch × seq_len × vocab_size]` tensor.
-   * **Solution:** Build a chunked CUDA kernel fusing `nn.Linear → log_softmax → nll_loss` that processes the vocab dimension in chunks without materializing the full logit tensor (saves up to 60% VRAM).
-3. **RMSNorm / LayerNorm Overhead:** Standard norms launch 3-4 separate kernels, wasting HBM bandwidth.
-   * **Solution:** A single fused CUDA C kernel that reads input once, computes mean/variance/normalization in shared memory, and writes output once.
-4. **RoPE (Rotary Positional Embeddings):** Standard RoPE does extra HBM reads/writes of Q and K.
-   * **Solution:** Fuse RoPE rotation directly into the FlashAttention QK computation in C++/CUDA.
-5. **LoRA Adapter Inefficiency:** Standard PEFT applies LoRA via separate matmuls and additions.
-   * **Solution:** Fused LoRA C/CUDA kernel performing `xW + x(AB)` in a single batched GEMM step.
-6. **Data Pipeline CPU Stalls:** Tokenization and packing in Python starve the GPU due to the GIL.
-   * **Solution:** A PyO3-bound Rust pipeline that multi-threads tokenization and sequence packing, filling a lock-free prefetch queue.
+- faster training throughput
+- faster inference throughput
+- lower memory use in both training and inference
 
----
+## Current State
 
-## 2. Repository Architecture
+What BarqTrain already does in native code:
 
-Use a monorepo structure to keep the multi-language stack organized:
+- CUDA fused RMSNorm
+- CUDA chunked cross-entropy to avoid full logits materialization during training
+- Rust sequence packing for the causal-LM data path
 
-```text
-barqtrain/
-├── python/                  # Python package (HF patching + trainer)
-│   └── barqtrain/
-│       ├── __init__.py
-│       ├── patch_models.py  # Monkey-patches HF models with custom ops
-│       └── benchmarks/      # Perf tracking scripts
-├── csrc/                    # CUDA/C++ Torch Extensions
-│   ├── src/                 # PyBind11 bindings
-│   ├── kernels/             # .cu files (FlashAttn, RMSNorm, ChunkedCE)
-│   └── CMakeLists.txt
-├── rust/                    # Rust core for data pipelines
-│   ├── Cargo.toml
-│   └── src/                 # PyO3 bindings, Rayon parallel packers
-├── tests/                   # Parity tests vs standard PyTorch
-├── pyproject.toml           # Build config (Maturin + Setuptools)
-└── README.md
-```
+What is still missing for meaningful inference-memory reduction:
 
----
+- native KV-cache management
+- native KV-cache compression / quantization
+- native decode-time logits optimization
+- native padding-free attention path for packed training batches
 
-## 3. Git Workflow & Best Practices
+## Why The Current Inference VRAM Barely Moves
 
-To maintain a clean, professional open-source history, BarqTrain enforces strict Git identity and **Atomic Commits**.
+In the current benchmark, full-weight model residency dominates GPU memory. That means total peak VRAM is mostly the model itself, not BarqTrain's execution buffers. As a result, CUDA kernel fusion can improve latency and throughput without changing total VRAM very much.
 
-### Git Identity Setup
-Ensure your commits are properly attributed to your developer profile:
-```bash
-# Set globally for your machine
-git config --global user.name "Your Name"
-git config --global user.email "you@example.com"
+To materially reduce inference memory, BarqTrain needs native work in the generation path itself:
 
-# OR set locally just for the BarqTrain repo
-git config user.name "Your Name"
-git config user.email "you@example.com"
+- paged KV-cache allocation
+- KV-cache quantization or offload
+- reduced decode-time temporary buffers
 
-# Verify
-git config --list
-```
+## Research Signals Guiding The Plan
 
-### Atomic & Conventional Commits
-An **atomic commit** contains exactly *one logical change*. Do not mix kernel development with documentation or unrelated bug fixes.
+The phases below are based on the most relevant public work for LLM training and serving:
 
-We follow the **Conventional Commits** specification (`type(scope): message`):
-* `feat(scope): ...` — New feature or kernel.
-* `fix(scope): ...` — Bug fix or numerics correction.
-* `perf(scope): ...` — Performance improvements.
-* `refactor(scope): ...` — Code restructuring.
-* `test(scope): ...` — Adding tests.
-* `docs(scope): ...` — Documentation changes.
+- [FlashAttention-3](https://arxiv.org/abs/2407.08608)
+- [PagedAttention / vLLM](https://arxiv.org/abs/2309.06180)
+- [KIVI KV-cache quantization](https://arxiv.org/abs/2402.02750)
+- [Cut Cross Entropy](https://arxiv.org/abs/2411.09009)
+- [Padding-Free Transformer](https://huggingface.co/blog/mayank-mishra/padding-free-transformer)
+- [PyTorch activation checkpointing techniques](https://pytorch.org/blog/activation-checkpointing-techniques/)
+- [Liger Kernel](https://github.com/linkedin/Liger-Kernel)
 
-*Examples:*
-* `feat(cuda/rmsnorm): implement fused forward pass`
-* `fix(rust/packer): resolve index out of bounds in bin-packing`
-* `perf(cuda/xent): chunk vocab dimension to reduce VRAM by 40%`
+## Phase 1: Native Memory Accounting And Decode Cleanup
 
----
+Goal:
+Establish accurate memory attribution before adding more kernels.
 
-## 4. Phase-by-Phase Implementation Plan
+Why first:
+Without separating resident model memory from KV-cache and scratch buffers, the project will keep optimizing the wrong number.
 
-### Phase 0: Bootstrap & Infrastructure (Day 1)
-**Goal:** Repo builds, imports, and runs a trivial "hello op".
-* Initialize Git repo, `.gitignore`, and basic folder structure.
-* Set up `pyproject.toml` to build both the C++ extension and the Rust PyO3 module.
-* **Commits:**
-  * `chore(repo): bootstrap BarqTrain skeleton`
-  * `build(python): configure pyproject for maturin and cmake`
+Native work:
 
-### Phase 1: Benchmark Harness (Day 2-3)
-**Goal:** Create a reproducible baseline to measure your future optimizations against.
-* Write a script that fine-tunes a tiny Llama/Qwen model on standard Hugging Face/PEFT.
-* Track tokens/sec, step time, and peak VRAM.
-* **Commits:**
-  * `feat(bench): add tokens/sec and VRAM tracking harness`
-  * `docs(bench): record baseline HF performance metrics`
+- CUDA-side instrumentation for:
+  - resident model memory
+  - KV-cache memory
+  - temporary decode buffers
+- decode path that only computes last-token logits during generation when full logits are not needed
+- explicit separation of training-memory and inference-memory metrics in the benchmark harness
 
-### Phase 2: Rust Data Pipeline (Day 4-7)
-**Goal:** Eliminate Python GIL GPU starvation.
-* Implement parallel sequence packing (bin-packing algorithms) in Rust using `rayon`.
-* Expose it to Python using `PyO3`.
-* Add a prefetch queue to feed the dataloader.
-* **Commits:**
-  * `feat(rust): initialize PyO3 crate`
-  * `feat(rust/pack): add multi-threaded sequence bin-packing`
-  * `perf(python/data): integrate Rust prefetch queue into trainer`
+Expected impact:
 
-### Phase 3: Fused RMSNorm (Week 2)
-**Goal:** Your first CUDA kernel win. Easy to implement, runs at every layer.
-* Write `fused_rmsnorm.cu` (one read, shared memory reduction, one write).
-* Wrap via `torch::extension` and `pybind11`.
-* Write a PyTorch autograd wrapper and test exact parity against `torch.nn.RMSNorm`.
-* **Commits:**
-  * `feat(cuda/rmsnorm): add fused rmsnorm forward and backward`
-  * `test(cuda/rmsnorm): add bf16 numerical parity tests`
-  * `feat(patch): add injection script to replace HF norms`
+- cleaner regression tracking
+- lower decode-time scratch memory
+- modest inference speed improvement
 
-### Phase 4: Chunked Cross-Entropy Loss (Week 2-3) **[HIGHEST ROI]**
-**Goal:** Massive VRAM reduction by avoiding logit materialization.
-* Write a custom kernel that fuses the final linear projection, log_softmax, and NLL loss.
-* Process the `vocab_size` dimension in SRAM chunks.
-* Compute the gradient w.r.t the hidden states directly.
-* **Commits:**
-  * `feat(cuda/xent): implement chunked linear and cross-entropy forward`
-  * `feat(cuda/xent): implement backward pass for dHidden`
-  * `perf(train): route trainer loss to use fused CE`
+Validation:
 
-### Phase 5: FlashAttention & Fused RoPE (Week 4-5)
-**Goal:** Speed up sequence processing and remove RoPE memory overhead.
-* Port or implement FlashAttention-2/3 kernels using CUTLASS.
-* Fuse Rotary Positional Embeddings directly into the Q and K load phase inside the attention kernel.
-* **Commits:**
-  * `feat(cuda/attn): integrate flash attention forward/backward`
-  * `feat(cuda/rope): fuse rope calculation into qk load phase`
-  * `test(cuda/attn): verify attention parity with causal masking`
+- report resident VRAM, peak VRAM, and decode overhead separately
+- verify no regression in generated text parity
 
-### Phase 6: Fused LoRA GEMM (Week 6)
-**Goal:** Drop the adapter addition overhead.
-* Implement a kernel to compute `xW_base + x(A@B)` in a single step for the forward pass during inference/validation, and optimize the backward gradient paths for frozen base weights.
-* **Commits:**
-  * `feat(cuda/lora): implement fused lora gemm forward`
-  * `perf(cuda/lora): optimize backward paths for frozen base weights`
+## Phase 2: CUDA Paged KV Cache
 
-### Phase 7: Packaging & Release
-**Goal:** Make BarqTrain installable via `pip`.
-* Finalize wheel generation.
-* Write usage instructions (e.g., `from barqtrain import patch_model; patch_model(model)`).
-* **Commits:**
-  * `build(ci): add GitHub actions for wheel building`
-  * `docs(readme): add installation and quickstart guide`
+Goal:
+Reduce inference memory fragmentation and enable longer contexts without allocating monolithic contiguous KV buffers.
 
----
+Research basis:
+[PagedAttention / vLLM](https://arxiv.org/abs/2309.06180)
 
-## 5. Implementation Code Patterns
+Native work:
 
-### Pattern A: Rust to Python (PyO3)
-```rust
-// rust/src/lib.rs
-use pyo3::prelude::*;
-use rayon::prelude::*;
+- CUDA page allocator for KV blocks
+- page table + gather/scatter kernels for attention reads
+- block recycling on decode steps
+- model patching hooks that route supported models through the paged cache path
 
-#[pyfunction]
-fn pack_sequences(sequences: Vec<Vec<u32>>, max_len: usize) -> Vec<Vec<u32>> {
-    sequences.par_iter()
-        .map(|seq| /* packing logic */ seq.clone())
-        .collect()
-}
+Expected impact:
 
-#[pymodule]
-fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
-    Ok(())
-}
-```
+- real inference-memory reduction under long contexts and batch growth
+- better serving stability
+- improved decode throughput from reduced allocator pressure
 
-### Pattern B: CUDA to PyTorch (PyBind11)
-```cpp
-// csrc/src/bindings.cpp
-#include <torch/extension.h>
+Validation:
 
-// Forward declaration of CUDA launcher
-torch::Tensor fused_rmsnorm_cuda(torch::Tensor input, torch::Tensor weight, float eps);
+- compare contiguous vs paged cache under long prompts
+- track OOM rate, fragmentation, and tokens/sec at fixed context length
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_rmsnorm", &fused_rmsnorm_cuda, "BarqTrain Fused RMSNorm (CUDA)");
-}
-```
+## Phase 3: CUDA Quantized KV Cache
 
-### Pattern C: Python Monkey-Patching
-```python
-# python/barqtrain/patch_models.py
-import torch
-import barqtrain_cuda as _C
+Goal:
+Compress KV-cache memory after the paged allocator exists.
 
-class BarqRMSNorm(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, w, eps):
-        out, rms = _C.fused_rmsnorm(x, w, eps)
-        ctx.save_for_backward(x, w, rms)
-        return out
+Research basis:
+[KIVI](https://arxiv.org/abs/2402.02750)
 
-def patch_llama(model):
-    import transformers
-    for module in model.modules():
-        if isinstance(module, transformers.models.llama.modeling_llama.LlamaRMSNorm):
-            # Swap standard norm with BarqTrain fused norm
-            module.forward = lambda x: BarqRMSNorm.apply(x, module.weight, module.variance_epsilon)
-```
+Native work:
+
+- quantized KV-cache storage in CUDA
+- residual full-precision window plus compressed older pages
+- dequant-on-read path integrated into attention kernels
+- runtime selection between full, paged, and quantized KV-cache modes
+
+Expected impact:
+
+- significant inference-memory reduction for long contexts
+- better throughput-per-GB for multi-request serving
+
+Validation:
+
+- perplexity / generation quality checks against fp16 or bf16 cache
+- memory reduction vs latency tradeoff curves
+
+## Phase 4: Fused Vocab Projection And Loss Path
+
+Goal:
+Reduce both training memory and decode-time temporary allocations around the LM head.
+
+Research basis:
+[Cut Cross Entropy](https://arxiv.org/abs/2411.09009) and [Liger Kernel](https://github.com/linkedin/Liger-Kernel)
+
+Native work:
+
+- extend the current chunked cross-entropy path into a more fully fused linear-plus-loss implementation
+- add decode-time last-token projection specialization so generation does not materialize more logits than necessary
+- reduce unnecessary fp32 promotion and temporary tensor retention in the native loss path
+
+Expected impact:
+
+- lower training activation pressure for large vocab models
+- faster training step time
+- less decode-time temporary memory
+
+Validation:
+
+- numerical parity against `torch.nn.functional.cross_entropy`
+- peak VRAM and tokens/sec on vocab-heavy models
+
+## Phase 5: Rust Packing Plus CUDA Padding-Free Training
+
+Goal:
+Stop paying for padded tokens during training.
+
+Research basis:
+[Padding-Free Transformer](https://huggingface.co/blog/mayank-mishra/padding-free-transformer)
+
+Native work:
+
+- Rust emits packed jagged metadata, offsets, and document boundaries
+- CUDA attention and loss kernels consume packed sequences directly
+- optional document-masked packed training mode for decoder-only fine-tuning
+
+Expected impact:
+
+- lower training memory from fewer padded activations
+- higher effective tokens/sec
+- better utilization on instruction-tuning datasets with variable sequence lengths
+
+Validation:
+
+- compare padded vs packed runs at identical effective tokens
+- verify document-boundary masking correctness
+
+## Phase 6: Training Activation Memory Control
+
+Goal:
+Reduce training-time activation memory so larger batches or longer sequences fit.
+
+Research basis:
+[PyTorch activation checkpointing techniques](https://pytorch.org/blog/activation-checkpointing-techniques/)
+
+Native work:
+
+- checkpoint-friendly native kernels and patched model wrappers
+- selective checkpointing around attention and MLP hot paths
+- training presets that combine chunked loss, packed batches, and checkpointing without breaking native kernels
+
+Expected impact:
+
+- materially lower training VRAM
+- larger batch size or sequence length on the same GPU
+
+Validation:
+
+- benchmark VRAM and throughput with and without selective checkpointing
+- ensure backward correctness and stable loss curves
+
+## Phase 7: Native Optimizer-State Memory Work
+
+Goal:
+Reduce optimizer-state overhead without depending entirely on external wrappers.
+
+Why later:
+Optimizer memory matters for training, but the highest immediate ROI is still in loss, attention, and padding elimination.
+
+Native work:
+
+- evaluate a native paged optimizer-state layout for BarqTrain-managed training loops
+- keep compatibility with bitsandbytes paths where native support is not ready
+- expose explicit memory/performance tradeoffs rather than a single default
+
+Expected impact:
+
+- lower optimizer-state pressure on fine-tuning jobs
+- cleaner BarqTrain-controlled training stack
+
+Validation:
+
+- optimizer-state memory accounting
+- convergence checks against standard AdamW baselines
+
+## Recommended Execution Order
+
+The highest-ROI sequence is:
+
+1. Phase 1: measure the right memory buckets
+2. Phase 2: paged KV-cache
+3. Phase 3: quantized KV-cache
+4. Phase 4: fused projection-plus-loss improvements
+5. Phase 5: padding-free packed training
+6. Phase 6: activation-memory control
+7. Phase 7: native optimizer-state work
+
+## Success Criteria
+
+BarqTrain should not claim a memory win unless at least one of these moves in the right direction on a matched benchmark:
+
+- lower resident VRAM
+- lower generation overhead VRAM
+- lower training peak VRAM
+- same VRAM with materially higher tokens/sec
+
+## Non-Goals For This Plan
+
+These items may still be useful, but they are not the primary path to native memory wins for BarqTrain right now:
+
+- Python-only benchmark reinterpretation without native changes
+- claiming inference-memory savings when only latency improved
+- model-weight quantization as the main story for BarqTrain
+
+## Deliverable Expectations Per Phase
+
+Each phase should end with all of the following:
+
+- native code landed in `csrc/` and/or `rust/`
+- a benchmark that isolates the claimed improvement
+- parity tests or tolerance-based numerical tests
+- README updates that clearly distinguish shipped features from roadmap work
