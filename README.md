@@ -27,13 +27,18 @@ BarqTrain works out of the box on Colab's GPU runtimes — no manual setup neede
 # Cell 1 – clone, install, and verify (run once per Colab session)
 !git clone -b test https://github.com/YASSERRMD/BarqTrain.git
 %cd BarqTrain
-!pip install -e . -q
+!apt-get install -y python3-dev curl build-essential
+!curl https://sh.rustup.rs -sSf | sh -s -- -y
+import os
+os.environ["PATH"] = f"{os.path.expanduser('~/.cargo/bin')}:{os.environ['PATH']}"
+!pip install -e . --no-build-isolation -q
 
 # Colab doesn't always reload .pth files in a running session —
 # this sys.path line makes the import work immediately.
-import sys, importlib
+import sys, importlib, importlib.util
 sys.path.insert(0, '/content/BarqTrain/python')
 importlib.invalidate_caches()
+assert importlib.util.find_spec("barqtrain_rs"), "barqtrain_rs did not build"
 
 import barqtrain
 from barqtrain import patch_model
@@ -163,7 +168,9 @@ git clone https://github.com/YASSERRMD/BarqTrain.git
 cd BarqTrain
 
 # Install Python package
-pip install -e .
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+export PATH="$HOME/.cargo/bin:$PATH"
+pip install -e . --no-build-isolation
 
 # Optional: build Rust extension (requires Rust + maturin)
 cd rust
