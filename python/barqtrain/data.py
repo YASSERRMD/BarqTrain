@@ -12,13 +12,22 @@ import torch
 
 from barqtrain._ffi import load_rust_backend
 
-_rust = load_rust_backend()
+_RUST_FALLBACK_WARNED = False
 
-if _rust is None:
+
+def _get_rust_backend():
+    return load_rust_backend()
+
+
+def _warn_rust_fallback_once() -> None:
+    global _RUST_FALLBACK_WARNED
+    if _RUST_FALLBACK_WARNED:
+        return
     warnings.warn(
         "BarqTrain Rust backend unavailable. Using Python fallback implementations. "
         "Install with: pip install -e ."
     )
+    _RUST_FALLBACK_WARNED = True
 
 
 class PackedBatch:
@@ -93,9 +102,10 @@ def pack_sequences(
         >>> len(batches)
         1
     """
-    if _rust is not None:
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None:
         # Use Rust implementation
-        rust_batches = _rust.pack_sequences(sequences, max_len)
+        rust_batches = rust_backend.pack_sequences(sequences, max_len)
         # Convert to Python PackedBatch objects
         return [
             PackedBatch(
@@ -107,6 +117,7 @@ def pack_sequences(
             for batch in rust_batches
         ]
     else:
+        _warn_rust_fallback_once()
         # Fallback to simple Python implementation
         return _pack_sequences_python(sequences, max_len)
 
@@ -188,10 +199,12 @@ def parallel_tokenize(texts: List[str], tokenizer_path: str) -> List[List[int]]:
     Returns:
         List of tokenized sequences
     """
-    if _rust is not None:
-        tokenized = _rust.parallel_tokenize(texts, tokenizer_path)
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None:
+        tokenized = rust_backend.parallel_tokenize(texts, tokenizer_path)
         return [list(seq) for seq in tokenized]
     else:
+        _warn_rust_fallback_once()
         # Fallback: simple character tokenization
         return [[ord(c) for c in text] for text in texts]
 
@@ -238,8 +251,9 @@ def pack_for_causal_lm(
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
 
-    if _rust is not None and hasattr(_rust, "pack_for_causal_lm"):
-        rust_batches = _rust.pack_for_causal_lm(
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "pack_for_causal_lm"):
+        rust_batches = rust_backend.pack_for_causal_lm(
             sequences,
             max_length,
             pad_token_id,
@@ -256,6 +270,7 @@ def pack_for_causal_lm(
             for batch in rust_batches
         ]
 
+    _warn_rust_fallback_once()
     return _pack_for_causal_lm_python(
         sequences=sequences,
         max_length=max_length,

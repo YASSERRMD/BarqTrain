@@ -7,12 +7,28 @@ fine-tuning with reduced memory and compute overhead.
 
 from typing import Optional
 
+import warnings
 import torch
 import torch.nn as nn
 
 from barqtrain._ffi import load_cuda_backend
 
-_C = load_cuda_backend()
+_CUDA_FALLBACK_WARNED = False
+
+
+def _get_cuda_backend():
+    return load_cuda_backend()
+
+
+def _warn_cuda_fallback_once() -> None:
+    global _CUDA_FALLBACK_WARNED
+    if _CUDA_FALLBACK_WARNED:
+        return
+    warnings.warn(
+        "BarqTrain CUDA backend unavailable. Falling back to PyTorch LoRA implementation. "
+        "Install with: pip install -e ."
+    )
+    _CUDA_FALLBACK_WARNED = True
 
 
 class FusedLoRAFunction(torch.autograd.Function):
@@ -48,13 +64,16 @@ class FusedLoRAFunction(torch.autograd.Function):
         Returns:
             Output tensor [batch_size, out_features]
         """
-        if _C is not None:
+        cuda_backend = _get_cuda_backend()
+        if cuda_backend is not None:
             # Use CUDA kernel
-            output = _C.fused_lora_forward(x, W_base, A, B, scaling)
+            output = cuda_backend.fused_lora_forward(x, W_base, A, B, scaling)
             ctx.save_for_backward(x, W_base, A, B)
             ctx.scaling = scaling
             return output
         else:
+            if x.is_cuda:
+                _warn_cuda_fallback_once()
             # Fallback to PyTorch implementation
             lora_output = x @ A.T @ B.T
             output = x @ W_base.T + lora_output * scaling
