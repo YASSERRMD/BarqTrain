@@ -5,45 +5,25 @@ This module provides Python wrappers around the Rust implementation
 for GIL-free, multi-threaded data processing.
 """
 
-import os
 from typing import Dict, List, Optional
 
-import warnings
 import torch
 
 from barqtrain._ffi import load_rust_backend
-
-_RUST_FALLBACK_WARNED = False
-
 
 def _get_rust_backend():
     return load_rust_backend()
 
 
-def _warn_rust_fallback_once() -> None:
-    global _RUST_FALLBACK_WARNED
-    if _RUST_FALLBACK_WARNED:
-        return
-    warnings.warn(
-        "BarqTrain Rust backend unavailable. Using Python fallback implementations. "
-        "Install with: pip install -e ."
-    )
-    _RUST_FALLBACK_WARNED = True
-
-
-def _rust_backend_required() -> bool:
-    value = os.environ.get("BARQTRAIN_REQUIRE_RUST", "0").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
-def _handle_missing_rust_backend() -> None:
-    if _rust_backend_required():
+def _require_rust_backend():
+    rust_backend = _get_rust_backend()
+    if rust_backend is None:
         raise RuntimeError(
-            "BarqTrain Rust backend is required but unavailable. "
-            "Install/build it first with `pip install -e . --no-build-isolation` "
-            "after installing a Rust toolchain."
+            "BarqTrain Rust backend is unavailable. "
+            "Build/install `barqtrain_rs` first with `pip install -e .` after "
+            "installing a Rust toolchain."
         )
-    _warn_rust_fallback_once()
+    return rust_backend
 
 
 class PackedBatch:
@@ -118,87 +98,16 @@ def pack_sequences(
         >>> len(batches)
         1
     """
-    rust_backend = _get_rust_backend()
-    if rust_backend is not None:
-        # Use Rust implementation
-        rust_batches = rust_backend.pack_sequences(sequences, max_len)
-        # Convert to Python PackedBatch objects
-        return [
-            PackedBatch(
-                input_ids=list(batch.input_ids),
-                attention_mask=list(batch.attention_mask),
-                sequence_ids=list(batch.sequence_ids),
-                position_ids=list(batch.position_ids),
-            )
-            for batch in rust_batches
-        ]
-    else:
-        _handle_missing_rust_backend()
-        # Fallback to simple Python implementation
-        return _pack_sequences_python(sequences, max_len)
-
-
-def _pack_sequences_python(
-    sequences: List[List[int]], max_len: int
-) -> List[PackedBatch]:
-    """
-    Fallback Python implementation of sequence packing.
-    Used when Rust extension is not available.
-    """
-    # Sort sequences by length (descending)
-    sorted_seqs = sorted(enumerate(sequences), key=lambda x: len(x[1]), reverse=True)
-
-    batches = []
-
-    for orig_idx, seq in sorted_seqs:
-        seq_len = len(seq)
-        placed = False
-
-        # Try to fit in existing batches
-        for batch in batches:
-            current_len = len(batch.input_ids)
-            if current_len + seq_len + 1 <= max_len:
-                # Add separator
-                if batch.input_ids:
-                    batch.input_ids.append(0)
-                    batch.attention_mask.append(0)
-                    batch.sequence_ids.append(-1)
-                    batch.position_ids.append(0)
-
-                # Add sequence
-                start_pos = len(batch.input_ids)
-                for pos, token in enumerate(seq):
-                    batch.input_ids.append(token)
-                    batch.attention_mask.append(1)
-                    batch.sequence_ids.append(orig_idx)
-                    batch.position_ids.append(start_pos + pos)
-                placed = True
-                break
-
-        # Create new batch if not placed
-        if not placed:
-            if seq_len > max_len:
-                # Truncate
-                truncated = seq[:max_len]
-                batches.append(
-                    PackedBatch(
-                        input_ids=truncated,
-                        attention_mask=[1] * len(truncated),
-                        sequence_ids=[orig_idx] * len(truncated),
-                        position_ids=list(range(len(truncated))),
-                    )
-                )
-            else:
-                batches.append(
-                    PackedBatch(
-                        input_ids=seq,
-                        attention_mask=[1] * seq_len,
-                        sequence_ids=[orig_idx] * seq_len,
-                        position_ids=list(range(seq_len)),
-                    )
-                )
-
-    return batches
+    rust_batches = _require_rust_backend().pack_sequences(sequences, max_len)
+    return [
+        PackedBatch(
+            input_ids=list(batch.input_ids),
+            attention_mask=list(batch.attention_mask),
+            sequence_ids=list(batch.sequence_ids),
+            position_ids=list(batch.position_ids),
+        )
+        for batch in rust_batches
+    ]
 
 
 def parallel_tokenize(texts: List[str], tokenizer_path: str) -> List[List[int]]:
@@ -215,14 +124,8 @@ def parallel_tokenize(texts: List[str], tokenizer_path: str) -> List[List[int]]:
     Returns:
         List of tokenized sequences
     """
-    rust_backend = _get_rust_backend()
-    if rust_backend is not None:
-        tokenized = rust_backend.parallel_tokenize(texts, tokenizer_path)
-        return [list(seq) for seq in tokenized]
-    else:
-        _handle_missing_rust_backend()
-        # Fallback: simple character tokenization
-        return [[ord(c) for c in text] for text in texts]
+    tokenized = _require_rust_backend().parallel_tokenize(texts, tokenizer_path)
+    return [list(seq) for seq in tokenized]
 
 
 def create_prefetch_queue(batches: List[PackedBatch]) -> PrefetchQueue:
@@ -267,91 +170,29 @@ def pack_for_causal_lm(
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
 
-    rust_backend = _get_rust_backend()
-    if rust_backend is not None and hasattr(rust_backend, "pack_for_causal_lm"):
-        rust_batches = rust_backend.pack_for_causal_lm(
-            sequences,
-            max_length,
-            pad_token_id,
-            eos_token_id,
-            label_pad_token_id,
-            drop_remainder,
+    rust_backend = _require_rust_backend()
+    if not hasattr(rust_backend, "pack_for_causal_lm"):
+        raise RuntimeError(
+            "BarqTrain Rust backend is missing `pack_for_causal_lm`. "
+            "Rebuild the native extension with `pip install -e .`."
         )
-        return [
-            {
-                "input_ids": list(batch.input_ids),
-                "attention_mask": list(batch.attention_mask),
-                "labels": list(batch.labels),
-            }
-            for batch in rust_batches
-        ]
 
-    _handle_missing_rust_backend()
-    return _pack_for_causal_lm_python(
-        sequences=sequences,
-        max_length=max_length,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_id,
-        label_pad_token_id=label_pad_token_id,
-        drop_remainder=drop_remainder,
+    rust_batches = rust_backend.pack_for_causal_lm(
+        sequences,
+        max_length,
+        pad_token_id,
+        eos_token_id,
+        label_pad_token_id,
+        drop_remainder,
     )
-
-
-def _pack_for_causal_lm_python(
-    sequences: List[List[int]],
-    max_length: int,
-    pad_token_id: int,
-    eos_token_id: Optional[int] = None,
-    label_pad_token_id: int = -100,
-    drop_remainder: bool = False,
-) -> List[Dict[str, List[int]]]:
-    """
-    Python fallback for causal LM packing when the Rust extension is unavailable.
-    """
-    eos_token_id = pad_token_id if eos_token_id is None else eos_token_id
-    packed_examples: List[Dict[str, List[int]]] = []
-    current_tokens: List[int] = []
-
-    def flush_current() -> None:
-        nonlocal current_tokens
-        if not current_tokens:
-            return
-        if drop_remainder and len(current_tokens) < max_length:
-            current_tokens = []
-            return
-
-        seq_len = len(current_tokens)
-        padded_tokens = current_tokens + [pad_token_id] * (max_length - seq_len)
-        attention_mask = [1] * seq_len + [0] * (max_length - seq_len)
-        labels = current_tokens + [label_pad_token_id] * (max_length - seq_len)
-        packed_examples.append(
-            {
-                "input_ids": padded_tokens,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
-        )
-        current_tokens = []
-
-    for seq in sequences:
-        if not seq:
-            continue
-
-        tokens = list(seq)
-        if tokens[-1] != eos_token_id:
-            tokens.append(eos_token_id)
-
-        cursor = 0
-        while cursor < len(tokens):
-            remaining = max_length - len(current_tokens)
-            take = min(remaining, len(tokens) - cursor)
-            current_tokens.extend(tokens[cursor : cursor + take])
-            cursor += take
-            if len(current_tokens) == max_length:
-                flush_current()
-
-    flush_current()
-    return packed_examples
+    return [
+        {
+            "input_ids": list(batch.input_ids),
+            "attention_mask": list(batch.attention_mask),
+            "labels": list(batch.labels),
+        }
+        for batch in rust_batches
+    ]
 
 
 class PackedCausalLMDataCollator:

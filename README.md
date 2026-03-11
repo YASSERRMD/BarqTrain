@@ -15,7 +15,8 @@
 
 ### Google Colab (NVIDIA GPU) 🚀
 
-BarqTrain works out of the box on Colab's GPU runtimes — no manual setup needed.
+BarqTrain requires a native Rust build during install. The Colab flow below installs
+the Rust toolchain first and fails immediately if `barqtrain_rs` does not build.
 
 **Step 1 — Select a GPU runtime**
 
@@ -25,13 +26,15 @@ BarqTrain works out of the box on Colab's GPU runtimes — no manual setup neede
 
 ```python
 # Cell 1 – clone, install, and verify (run once per Colab session)
-!git clone -b test https://github.com/YASSERRMD/BarqTrain.git
+!git clone https://github.com/YASSERRMD/BarqTrain.git
 %cd BarqTrain
 !apt-get install -y python3-dev curl build-essential
 !curl https://sh.rustup.rs -sSf | sh -s -- -y
 import os
 os.environ["PATH"] = f"{os.path.expanduser('~/.cargo/bin')}:{os.environ['PATH']}"
-!pip install -e . --no-build-isolation -q
+!python -m pip install --upgrade pip setuptools wheel setuptools-rust
+!python -m pip install ninja packaging datasets accelerate peft trl
+!python -m pip install -e . --no-build-isolation
 
 # Colab doesn't always reload .pth files in a running session —
 # this sys.path line makes the import work immediately.
@@ -39,6 +42,8 @@ import sys, importlib, importlib.util
 sys.path.insert(0, '/content/BarqTrain/python')
 importlib.invalidate_caches()
 assert importlib.util.find_spec("barqtrain_rs"), "barqtrain_rs did not build"
+import barqtrain._ffi as ffi
+assert ffi.load_rust_backend() is not None, "barqtrain_rs did not load"
 
 import barqtrain
 from barqtrain import patch_model
@@ -57,10 +62,13 @@ The CUDA kernels give the biggest speedups. Compilation takes ~2 min on Colab.
 !apt-get install -y python3-dev
 
 # Cell 3b – compile CUDA kernels (T4 / A100 / L4 / V100 all supported)
-!BARQTRAIN_BUILD_CUDA=1 pip install -e . --no-build-isolation
+!BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
 
 # Verify the CUDA extension loaded
-import barqtrain_cuda
+import importlib.util
+assert importlib.util.find_spec("barqtrain_cuda"), "barqtrain_cuda did not build"
+import barqtrain._ffi as ffi
+assert ffi.load_cuda_backend() is not None, "barqtrain_cuda did not load"
 print("CUDA extension loaded ✓")
 ```
 
@@ -158,7 +166,7 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
   <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_training_inference_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 - Benchmark Comparison (`examples/barqtrain_benchmark_comparison_colab.ipynb`):
   <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_benchmark_comparison_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
-  Uses `ninja`, your requested Unsloth install flow, cleans up VRAM between runs, and marks the BarqTrain CUDA result valid only when `cuda_backend_loaded == True`.
+  Both notebooks fail fast if `barqtrain_rs` or `barqtrain_cuda` do not load. The benchmark notebook compares only baseline HF, compiled BarqTrain CUDA, and full-weight Unsloth.
 
 ### Local (from source)
 
@@ -167,18 +175,20 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 git clone https://github.com/YASSERRMD/BarqTrain.git
 cd BarqTrain
 
-# Install Python package
+# Install Python package and native Rust build dependencies
 curl https://sh.rustup.rs -sSf | sh -s -- -y
 export PATH="$HOME/.cargo/bin:$PATH"
-pip install -e . --no-build-isolation
+python -m pip install --upgrade pip setuptools wheel setuptools-rust
+python -m pip install -e . --no-build-isolation
 
-# Optional: build Rust extension (requires Rust + maturin)
-cd rust
-maturin develop --release
-cd ..
+# Verify the Rust extension was built
+python - <<'PY'
+import importlib.util
+assert importlib.util.find_spec("barqtrain_rs"), "barqtrain_rs did not build"
+PY
 
 # Optional: build CUDA kernels (requires NVIDIA GPU + CUDA toolkit)
-BARQTRAIN_BUILD_CUDA=1 pip install -e . --no-build-isolation
+BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
 ```
 
 ### Training Helpers
