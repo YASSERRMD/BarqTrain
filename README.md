@@ -53,7 +53,7 @@ the Rust toolchain first and fails immediately if `barqtrain_rs` does not build.
 
 ```python
 # Cell 1 – clone, install, and verify (run once per Colab session)
-!git clone https://github.com/YASSERRMD/BarqTrain.git
+!git clone -b codex/phase_24-colab-branch-fix https://github.com/YASSERRMD/BarqTrain.git
 %cd BarqTrain
 from pathlib import Path
 from urllib.request import urlopen
@@ -212,16 +212,16 @@ print(f"VRAM used: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 ### Ready-to-use Colab notebooks (in this repo)
 
 - Training + Inference (`examples/barqtrain_training_inference_colab.ipynb`):
-  <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_training_inference_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
+  <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/codex/phase_24-colab-branch-fix/examples/barqtrain_training_inference_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 - Benchmark Comparison (`examples/barqtrain_benchmark_comparison_colab.ipynb`):
-  <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/main/examples/barqtrain_benchmark_comparison_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
+  <a href="https://colab.research.google.com/github/YASSERRMD/BarqTrain/blob/codex/phase_24-colab-branch-fix/examples/barqtrain_benchmark_comparison_colab.ipynb" target="_blank" rel="noopener noreferrer"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
   Both notebooks now make the post-build restart explicit and include a runtime verification step for `barqtrain_rs` and `barqtrain_cuda`.
 
 ### Local (from source)
 
 ```bash
 # Clone the repository
-git clone https://github.com/YASSERRMD/BarqTrain.git
+git clone -b codex/phase_24-colab-branch-fix https://github.com/YASSERRMD/BarqTrain.git
 cd BarqTrain
 
 # Install Python package and native Rust build dependencies
