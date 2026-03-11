@@ -5,9 +5,10 @@ This module provides Python wrappers around the Rust implementation
 for GIL-free, multi-threaded data processing.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import warnings
+import torch
 
 from barqtrain._ffi import load_rust_backend
 
@@ -206,3 +207,182 @@ def create_prefetch_queue(batches: List[PackedBatch]) -> PrefetchQueue:
         PrefetchQueue for iteration
     """
     return PrefetchQueue(batches)
+
+
+def pack_for_causal_lm(
+    sequences: List[List[int]],
+    max_length: int,
+    pad_token_id: int,
+    eos_token_id: Optional[int] = None,
+    label_pad_token_id: int = -100,
+    drop_remainder: bool = False,
+) -> List[Dict[str, List[int]]]:
+    """
+    Pack tokenized sequences into fixed-length causal LM blocks.
+
+    This reduces padding waste by concatenating examples with EOS separators
+    and slicing the result into `max_length` training blocks.
+
+    Args:
+        sequences: Tokenized sequences without batch dimension
+        max_length: Target packed block size
+        pad_token_id: Padding token for the final partial block
+        eos_token_id: Separator token inserted between sequences.
+            Defaults to `pad_token_id` when not provided.
+        label_pad_token_id: Label value used for ignored padding positions
+        drop_remainder: Drop the final partial block instead of padding it
+
+    Returns:
+        List of dicts with `input_ids`, `attention_mask`, and `labels`
+    """
+    if max_length <= 0:
+        raise ValueError("max_length must be > 0")
+
+    if _rust is not None and hasattr(_rust, "pack_for_causal_lm"):
+        rust_batches = _rust.pack_for_causal_lm(
+            sequences,
+            max_length,
+            pad_token_id,
+            eos_token_id,
+            label_pad_token_id,
+            drop_remainder,
+        )
+        return [
+            {
+                "input_ids": list(batch.input_ids),
+                "attention_mask": list(batch.attention_mask),
+                "labels": list(batch.labels),
+            }
+            for batch in rust_batches
+        ]
+
+    return _pack_for_causal_lm_python(
+        sequences=sequences,
+        max_length=max_length,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        label_pad_token_id=label_pad_token_id,
+        drop_remainder=drop_remainder,
+    )
+
+
+def _pack_for_causal_lm_python(
+    sequences: List[List[int]],
+    max_length: int,
+    pad_token_id: int,
+    eos_token_id: Optional[int] = None,
+    label_pad_token_id: int = -100,
+    drop_remainder: bool = False,
+) -> List[Dict[str, List[int]]]:
+    """
+    Python fallback for causal LM packing when the Rust extension is unavailable.
+    """
+    eos_token_id = pad_token_id if eos_token_id is None else eos_token_id
+    packed_examples: List[Dict[str, List[int]]] = []
+    current_tokens: List[int] = []
+
+    def flush_current() -> None:
+        nonlocal current_tokens
+        if not current_tokens:
+            return
+        if drop_remainder and len(current_tokens) < max_length:
+            current_tokens = []
+            return
+
+        seq_len = len(current_tokens)
+        padded_tokens = current_tokens + [pad_token_id] * (max_length - seq_len)
+        attention_mask = [1] * seq_len + [0] * (max_length - seq_len)
+        labels = current_tokens + [label_pad_token_id] * (max_length - seq_len)
+        packed_examples.append(
+            {
+                "input_ids": padded_tokens,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+        )
+        current_tokens = []
+
+    for seq in sequences:
+        if not seq:
+            continue
+
+        tokens = list(seq)
+        if tokens[-1] != eos_token_id:
+            tokens.append(eos_token_id)
+
+        cursor = 0
+        while cursor < len(tokens):
+            remaining = max_length - len(current_tokens)
+            take = min(remaining, len(tokens) - cursor)
+            current_tokens.extend(tokens[cursor : cursor + take])
+            cursor += take
+            if len(current_tokens) == max_length:
+                flush_current()
+
+    flush_current()
+    return packed_examples
+
+
+class PackedCausalLMDataCollator:
+    """
+    Collate tokenized causal LM samples into packed fixed-length blocks.
+
+    The collator accepts tokenized samples with `input_ids` and optional
+    `attention_mask`, trims padding, concatenates sequences, and emits packed
+    blocks ready for standard Hugging Face causal LM training.
+    """
+
+    def __init__(
+        self,
+        max_length: int,
+        pad_token_id: int,
+        eos_token_id: Optional[int] = None,
+        label_pad_token_id: int = -100,
+        drop_remainder: bool = False,
+    ):
+        self.max_length = max_length
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = pad_token_id if eos_token_id is None else eos_token_id
+        self.label_pad_token_id = label_pad_token_id
+        self.drop_remainder = drop_remainder
+
+    def _trim_tokens(self, example: Dict[str, List[int]]) -> List[int]:
+        input_ids = list(example["input_ids"])
+        attention_mask = example.get("attention_mask")
+
+        if attention_mask is None:
+            return input_ids
+
+        return [token for token, mask in zip(input_ids, attention_mask) if mask]
+
+    def __call__(self, examples: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        sequences = [self._trim_tokens(example) for example in examples]
+        packed_examples = pack_for_causal_lm(
+            sequences=sequences,
+            max_length=self.max_length,
+            pad_token_id=self.pad_token_id,
+            eos_token_id=self.eos_token_id,
+            label_pad_token_id=self.label_pad_token_id,
+            drop_remainder=self.drop_remainder,
+        )
+
+        if not packed_examples:
+            packed_examples = [
+                {
+                    "input_ids": [self.pad_token_id] * self.max_length,
+                    "attention_mask": [0] * self.max_length,
+                    "labels": [self.label_pad_token_id] * self.max_length,
+                }
+            ]
+
+        return {
+            "input_ids": torch.tensor(
+                [example["input_ids"] for example in packed_examples], dtype=torch.long
+            ),
+            "attention_mask": torch.tensor(
+                [example["attention_mask"] for example in packed_examples], dtype=torch.long
+            ),
+            "labels": torch.tensor(
+                [example["labels"] for example in packed_examples], dtype=torch.long
+            ),
+        }

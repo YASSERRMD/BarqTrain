@@ -19,11 +19,19 @@ def test_barqtrain_imports():
 
 def test_barqtrain_api_exports():
     """Core API symbols are exported from the top-level package."""
-    from barqtrain import patch_model, patch_llama, patch_qwen
+    from barqtrain import (
+        PackedCausalLMDataCollator,
+        pack_for_causal_lm,
+        patch_llama,
+        patch_model,
+        patch_qwen,
+    )
 
     assert callable(patch_model)
     assert callable(patch_llama)
     assert callable(patch_qwen)
+    assert callable(pack_for_causal_lm)
+    assert callable(PackedCausalLMDataCollator)
 
 
 def test_ops_fallback_rmsnorm():

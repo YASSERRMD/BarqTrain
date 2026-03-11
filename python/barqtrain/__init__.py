@@ -37,6 +37,7 @@ from barqtrain.patch_models import (
     patch_model,
     patch_qwen,
 )
+from barqtrain.data import PackedCausalLMDataCollator, pack_for_causal_lm
 
 __all__ = [
     "patch_model",
@@ -51,5 +52,7 @@ __all__ = [
     "patch_gemma",
     "patch_lfm2",
     "patch_qwen",
+    "pack_for_causal_lm",
+    "PackedCausalLMDataCollator",
     "__version__",
 ]
