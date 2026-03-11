@@ -38,6 +38,12 @@ from barqtrain.patch_models import (
     patch_qwen,
 )
 from barqtrain.data import PackedCausalLMDataCollator, pack_for_causal_lm
+from barqtrain.memory import (
+    CudaMemorySnapshot,
+    build_generation_kwargs,
+    cuda_memory_snapshot,
+    generation_overhead_mb,
+)
 from barqtrain.optim import create_optimizer
 
 __all__ = [
@@ -55,6 +61,10 @@ __all__ = [
     "patch_qwen",
     "pack_for_causal_lm",
     "PackedCausalLMDataCollator",
+    "CudaMemorySnapshot",
+    "cuda_memory_snapshot",
+    "generation_overhead_mb",
+    "build_generation_kwargs",
     "create_optimizer",
     "__version__",
 ]
