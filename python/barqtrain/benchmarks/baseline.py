@@ -24,11 +24,11 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainingArguments,
-    Trainer,
 )
 from datasets import load_dataset
-from transformers import DataCollatorForLanguageModeling
+
+from barqtrain.data import PackedCausalLMDataCollator
+from barqtrain.optim import create_optimizer
 
 
 @dataclass
@@ -44,6 +44,8 @@ class BenchmarkMetrics:
     tokens_per_second: float
     avg_step_time_seconds: float
     peak_vram_mb: float
+    packing_enabled: bool = False
+    optimizer_name: str = "adamw"
     gpu_utilization_percent: Optional[float] = None
 
 
@@ -56,12 +58,16 @@ class BenchmarkHarness:
         batch_size: int = 4,
         sequence_length: int = 512,
         num_steps: int = 100,
+        use_packing: bool = False,
+        optimizer_name: str = "adamw",
         output_dir: Optional[str] = None,
     ):
         self.model_name = model_name
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.num_steps = num_steps
+        self.use_packing = use_packing
+        self.optimizer_name = optimizer_name
         self.output_dir = Path(output_dir) if output_dir else Path("benchmarks/results")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,7 +102,7 @@ class BenchmarkHarness:
                 examples["text"],
                 truncation=True,
                 max_length=self.sequence_length,
-                padding="max_length",
+                padding=False if self.use_packing else "max_length",
                 return_overflowing_tokens=False,
             )
 
@@ -108,11 +114,20 @@ class BenchmarkHarness:
         )
 
         # Create DataLoader
+        collate_fn = None
+        if self.use_packing:
+            collate_fn = PackedCausalLMDataCollator(
+                max_length=self.sequence_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
         dataloader = DataLoader(
             tokenized_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=0,  # For baseline, we use Python workers
+            collate_fn=collate_fn,
         )
 
         return dataloader
@@ -132,6 +147,8 @@ class BenchmarkHarness:
         print(f"Batch Size: {self.batch_size}")
         print(f"Sequence Length: {self.sequence_length}")
         print(f"Steps: {self.num_steps}")
+        print(f"Packing Enabled: {self.use_packing}")
+        print(f"Optimizer: {self.optimizer_name}")
         print(f"Device: {self.device}")
         print(f"{'='*60}\n")
 
@@ -151,7 +168,11 @@ class BenchmarkHarness:
         total_tokens = 0
 
         data_iter = iter(dataloader)
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        optimizer = create_optimizer(
+            self.model.parameters(),
+            lr=1e-5,
+            optimizer_name=self.optimizer_name,
+        )
 
         for step in range(self.num_steps):
             try:
@@ -163,13 +184,20 @@ class BenchmarkHarness:
             # Move batch to device
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
+            labels = batch.get("labels")
+            if labels is None:
+                labels = input_ids
+            else:
+                labels = labels.to(self.device)
+
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
 
             # Forward pass
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=input_ids,
-            )
+            outputs = self.model(**model_inputs)
             loss = outputs.loss
 
             # Backward pass
@@ -178,7 +206,7 @@ class BenchmarkHarness:
             optimizer.zero_grad()
 
             # Track metrics
-            total_tokens += input_ids.numel()
+            total_tokens += labels.ne(-100).sum().item()
 
             if (step + 1) % 10 == 0:
                 current_time = time.time()
@@ -206,6 +234,8 @@ class BenchmarkHarness:
             tokens_per_second=total_tokens / total_time,
             avg_step_time_seconds=total_time / self.num_steps,
             peak_vram_mb=peak_vram,
+            packing_enabled=self.use_packing,
+            optimizer_name=self.optimizer_name,
         )
 
         return metrics
@@ -248,6 +278,18 @@ def main():
         "--steps", type=int, default=100, help="Number of training steps"
     )
     parser.add_argument(
+        "--use-packing",
+        action="store_true",
+        help="Enable sequence packing collator for causal LM training",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "paged_adamw_32bit", "paged_adamw_8bit"],
+        help="Optimizer to benchmark",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="benchmarks/results",
@@ -261,6 +303,8 @@ def main():
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,
         num_steps=args.steps,
+        use_packing=args.use_packing,
+        optimizer_name=args.optimizer,
         output_dir=args.output_dir,
     )
 
