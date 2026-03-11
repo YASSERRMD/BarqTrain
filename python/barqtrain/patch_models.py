@@ -316,6 +316,19 @@ def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     return _patch_generic(model)
 
 
+def patch_inference(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Apply BarqTrain's inference-oriented patches without forcing RMSNorm rewrites.
+
+    This is intended for decode benchmarking and low-memory generation where the
+    main BarqTrain value comes from cache handling and backend selection.
+    """
+    model_config = getattr(model, "config", None)
+    model_type = getattr(model_config, "model_type", None) or "model"
+    _configure_attention_backend(model, model_type)
+    return _patch_generate_with_paged_kv(model, model_type)
+
+
 def _patch_rmsnorm_layers(
     model: torch.nn.Module,
     rmsnorm_class: type,

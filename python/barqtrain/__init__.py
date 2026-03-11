@@ -34,6 +34,7 @@ from barqtrain.patch_models import (
     patch_mistral,
     patch_olmo,
     patch_phi,
+    patch_inference,
     patch_model,
     patch_qwen,
 )
@@ -49,6 +50,7 @@ from barqtrain.optim import create_optimizer
 
 __all__ = [
     "patch_model",
+    "patch_inference",
     "patch_llama",
     "patch_llama4",
     "patch_mistral",

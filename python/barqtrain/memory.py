@@ -65,6 +65,13 @@ def preferred_last_token_logits_kwarg(model: torch.nn.Module) -> Optional[str]:
     """
     Detect a forward kwarg that limits logits materialization to the decode token.
     """
+    supports_logits_to_keep = getattr(model, "_supports_logits_to_keep", None)
+    if callable(supports_logits_to_keep):
+        try:
+            if supports_logits_to_keep():
+                return "logits_to_keep"
+        except Exception:
+            pass
     return _model_forward_parameter_name(model, ("logits_to_keep", "num_logits_to_keep"))
 
 

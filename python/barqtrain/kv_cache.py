@@ -30,10 +30,8 @@ def _decoder_config(config):
     return config.get_text_config(decoder=True) if hasattr(config, "get_text_config") else config
 
 
-def _resolve_model_dtype(model: torch.nn.Module) -> torch.dtype:
-    for parameter in model.parameters():
-        return parameter.dtype
-    return torch.float16
+def _min_paged_kv_cache_len() -> int:
+    return int(os.environ.get("BARQTRAIN_PAGED_KV_MIN_CACHE_LEN", "256"))
 
 
 class BarqPagedKVCacheLayer(CacheLayerMixin):
@@ -288,6 +286,9 @@ def maybe_prepare_paged_kv_generate_kwargs(model: torch.nn.Module, args, kwargs)
         if max_length is None:
             return kwargs, False
         max_cache_len = int(max(max_length, prompt_length))
+
+    if max_cache_len < _min_paged_kv_cache_len():
+        return kwargs, False
 
     page_size = int(os.environ.get("BARQTRAIN_PAGED_KV_PAGE_SIZE", "16"))
     cache = create_paged_kv_cache(

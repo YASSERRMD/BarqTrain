@@ -23,12 +23,14 @@ def test_barqtrain_api_exports():
         PackedCausalLMDataCollator,
         create_optimizer,
         pack_for_causal_lm,
+        patch_inference,
         patch_llama,
         patch_model,
         patch_qwen,
     )
 
     assert callable(patch_model)
+    assert callable(patch_inference)
     assert callable(patch_llama)
     assert callable(patch_qwen)
     assert callable(pack_for_causal_lm)

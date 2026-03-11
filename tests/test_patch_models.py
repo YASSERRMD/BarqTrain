@@ -69,6 +69,25 @@ def test_patch_model_skips_when_already_patched(monkeypatch):
     assert called["count"] == 1
 
 
+def test_patch_inference_wraps_generate_without_full_model_patch(monkeypatch):
+    model = DummyModel(model_type="qwen2", architectures=["Qwen2ForCausalLM"])
+    model.generate = lambda *args, **kwargs: kwargs
+
+    called = {"count": 0}
+
+    def _patch_generate(m, label):
+        called["count"] += 1
+        return m
+
+    monkeypatch.setattr(patch_models, "_patch_generate_with_paged_kv", _patch_generate)
+    monkeypatch.setattr(patch_models, "_configure_attention_backend", lambda *args, **kwargs: "sdpa")
+
+    patched = patch_models.patch_inference(model)
+
+    assert patched is model
+    assert called["count"] == 1
+
+
 def test_patch_causal_lm_chunked_loss_uses_barqtrain_loss(monkeypatch):
     class TinyBackbone(torch.nn.Module):
         def __init__(self, hidden_size):
