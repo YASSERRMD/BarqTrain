@@ -98,7 +98,11 @@ if os.environ.get("BARQTRAIN_BUILD_CUDA"):
         else:
             print("Warning: CUDA extension skipped: CUDA toolkit not found")
     except Exception as e:
-        print(f"Warning: CUDA extension skipped: {e}")
+        print(
+            "Warning: CUDA extension skipped: "
+            f"{e}. If torch is already installed, retry with "
+            "`BARQTRAIN_BUILD_CUDA=1 pip install -e . --no-build-isolation`."
+        )
 
 # Always call setup() — pip needs it for editable install metadata.
 # pyproject.toml owns all package/name/version metadata.

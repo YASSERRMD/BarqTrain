@@ -52,7 +52,7 @@ The CUDA kernels give the biggest speedups. Compilation takes ~2 min on Colab.
 !apt-get install -y python3-dev
 
 # Cell 3b – compile CUDA kernels (T4 / A100 / L4 / V100 all supported)
-!BARQTRAIN_BUILD_CUDA=1 pip install -e .
+!BARQTRAIN_BUILD_CUDA=1 pip install -e . --no-build-isolation
 
 # Verify the CUDA extension loaded
 import barqtrain_cuda
@@ -171,14 +171,14 @@ maturin develop --release
 cd ..
 
 # Optional: build CUDA kernels (requires NVIDIA GPU + CUDA toolkit)
-BARQTRAIN_BUILD_CUDA=1 pip install -e .
+BARQTRAIN_BUILD_CUDA=1 pip install -e . --no-build-isolation
 ```
 
 ### Training Helpers
 
 BarqTrain exposes thin helpers for the optimized training path:
 
-- `patch_model(model)`: patches supported RMSNorm layers and configures the best attention backend available
+- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, and routes compatible decoder-only training with labels through chunked loss
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
 
