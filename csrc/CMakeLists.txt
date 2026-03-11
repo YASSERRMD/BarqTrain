@@ -92,6 +92,7 @@ set(SRC_FILES
     kernels/flash_attention.cu
     kernels/chunked_cross_entropy.cu
     kernels/lora.cu
+    kernels/paged_kv_cache.cu
 )
 
 add_library(${PROJECT_NAME} SHARED ${SRC_FILES})

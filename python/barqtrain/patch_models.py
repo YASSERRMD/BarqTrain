@@ -232,6 +232,35 @@ def _patch_causal_lm_chunked_loss(
     return model
 
 
+def _patch_generate_with_paged_kv(
+    model: torch.nn.Module,
+    model_label: str,
+) -> torch.nn.Module:
+    """
+    Wrap model.generate() to inject BarqTrain's paged KV cache on CUDA runs.
+    """
+    if getattr(model, "_barqtrain_generate_paged_kv_patched", False):
+        return model
+    if not hasattr(model, "generate"):
+        return model
+
+    from barqtrain.kv_cache import maybe_prepare_paged_kv_generate_kwargs, paged_kv_supported_for_model
+
+    original_generate = model.generate
+
+    def generate(self, *args, **kwargs):
+        updated_kwargs, used_paged_kv = maybe_prepare_paged_kv_generate_kwargs(self, args, kwargs)
+        setattr(self, "_barqtrain_last_generate_used_paged_kv", used_paged_kv)
+        return original_generate(*args, **updated_kwargs)
+
+    model.generate = types.MethodType(generate, model)
+    setattr(model, "_barqtrain_generate_paged_kv_patched", True)
+    setattr(model, "_barqtrain_paged_kv_supported", paged_kv_supported_for_model(model))
+    if getattr(model, "_barqtrain_paged_kv_supported", False):
+        print(f"BarqTrain: Enabled paged KV-cache injection for {model_label}")
+    return model
+
+
 def patch_model(model: torch.nn.Module) -> torch.nn.Module:
     """
     Patch a Hugging Face model with BarqTrain optimizations.
@@ -368,6 +397,7 @@ def patch_llama(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Llama")
     model = _patch_causal_lm_chunked_loss(model, "Llama")
+    model = _patch_generate_with_paged_kv(model, "Llama")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -399,6 +429,7 @@ def patch_lfm2(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "LFM2")
     model = _patch_causal_lm_chunked_loss(model, "LFM2")
+    model = _patch_generate_with_paged_kv(model, "LFM2")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -430,6 +461,7 @@ def patch_mistral(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Mistral/Mixtral")
     model = _patch_causal_lm_chunked_loss(model, "Mistral/Mixtral")
+    model = _patch_generate_with_paged_kv(model, "Mistral/Mixtral")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -464,6 +496,7 @@ def patch_deepseek(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "DeepSeek")
     model = _patch_causal_lm_chunked_loss(model, "DeepSeek")
+    model = _patch_generate_with_paged_kv(model, "DeepSeek")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -498,6 +531,7 @@ def patch_phi(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Phi")
     model = _patch_causal_lm_chunked_loss(model, "Phi")
+    model = _patch_generate_with_paged_kv(model, "Phi")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -532,6 +566,7 @@ def patch_olmo(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "OLMo")
     model = _patch_causal_lm_chunked_loss(model, "OLMo")
+    model = _patch_generate_with_paged_kv(model, "OLMo")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -566,6 +601,7 @@ def patch_granite(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Granite")
     model = _patch_causal_lm_chunked_loss(model, "Granite")
+    model = _patch_generate_with_paged_kv(model, "Granite")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -591,6 +627,7 @@ def patch_jamba(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Jamba")
     model = _patch_causal_lm_chunked_loss(model, "Jamba")
+    model = _patch_generate_with_paged_kv(model, "Jamba")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -616,6 +653,7 @@ def patch_llama4(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Llama4")
     model = _patch_causal_lm_chunked_loss(model, "Llama4")
+    model = _patch_generate_with_paged_kv(model, "Llama4")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -649,6 +687,7 @@ def patch_gemma(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Gemma")
     model = _patch_causal_lm_chunked_loss(model, "Gemma")
+    model = _patch_generate_with_paged_kv(model, "Gemma")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -704,6 +743,7 @@ def patch_qwen(model: torch.nn.Module) -> torch.nn.Module:
     """
     _configure_attention_backend(model, "Qwen")
     model = _patch_causal_lm_chunked_loss(model, "Qwen")
+    model = _patch_generate_with_paged_kv(model, "Qwen")
     return _patch_rmsnorm_targets(
         model,
         [
@@ -748,8 +788,7 @@ def _patch_generic(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         The patched model
     """
-    # TODO: Implement generic patching logic
-    return model
+    return _patch_generate_with_paged_kv(model, "generic model")
 
 
 def unpatch_model(model: torch.nn.Module) -> torch.nn.Module:

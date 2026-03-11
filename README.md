@@ -9,6 +9,7 @@
 - **FlashAttention Integration**: `patch_model(...)` selects `flash_attention_2` when available and falls back to PyTorch SDPA otherwise
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
+- **Paged KV Cache**: CUDA-backed paged cache append path that avoids `torch.cat` cache growth during generation
 - **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
 
 ## Current Status
@@ -20,8 +21,8 @@ BarqTrain is already a useful native acceleration layer, but it is not yet a ful
 | RMSNorm | CUDA kernel shipped | lower kernel overhead | deeper fusion into larger blocks |
 | Cross-entropy | CUDA chunked loss shipped | lower training memory and better training throughput | more fused projection-plus-loss work |
 | Data path | Rust packing shipped | lower Python overhead and less padding waste | padding-free end-to-end training path |
-| Attention | backend selection shipped | faster attention when FlashAttention is available | native KV-cache memory management |
-| Inference memory | partial | speed wins today | paged and quantized KV-cache |
+| Attention | backend selection shipped | faster attention when FlashAttention is available | deeper native attention fusion |
+| Inference memory | phase 1+2 shipped | resident/peak accounting plus paged KV-cache generation | quantized/offloaded KV-cache and page-table compaction |
 | Optimizer memory | wrapper-level | optional training-memory savings | native optimizer-state control |
 
 ## Research-Backed Roadmap
@@ -212,15 +213,19 @@ PY
 
 # Optional: build CUDA kernels (requires NVIDIA GPU + CUDA toolkit)
 BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
+
+# Headless/Docker CUDA build without a visible GPU:
+BARQTRAIN_CUDA_ARCH_LIST=7.5 BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
 ```
 
 ### Training Helpers
 
 BarqTrain exposes thin helpers for the optimized training path:
 
-- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, and routes compatible decoder-only training with labels through chunked loss
+- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through chunked loss, and wraps compatible CUDA generation calls to inject BarqTrain's paged KV cache automatically
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
+- `create_paged_kv_cache(...)`: explicitly create a paged KV cache when you want to control decode capacity yourself
 
 ```python
 from datasets import load_dataset
@@ -261,6 +266,26 @@ optimizer = create_optimizer(
 )
 ```
 
+### Inference Helpers
+
+For explicit decode-cache control, you can create and pass a paged KV cache yourself:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from barqtrain import create_paged_kv_cache, patch_model
+
+model_id = "Qwen/Qwen2-0.5B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).cuda()
+patch_model(model)
+
+inputs = tokenizer("Explain paged KV caches.", return_tensors="pt").to("cuda")
+cache = create_paged_kv_cache(model, max_batch_size=1, max_cache_len=256, page_size=16)
+outputs = model.generate(**inputs, max_new_tokens=64, past_key_values=cache)
+```
+
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -296,9 +321,15 @@ trainer.train()
 BarqTrain should be evaluated in two separate ways:
 
 - **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
-- **Inference path**: the current native stack already improves latency and tokens/sec, but total peak VRAM on short full-weight runs is still often dominated by model residency.
+- **Inference path**: the current native stack now measures resident VRAM separately and ships a paged KV cache for decode-time cache growth, but total peak VRAM on short full-weight runs can still be dominated by model residency.
 
 That distinction matters. A faster inference benchmark does not automatically mean lower total VRAM if model weights remain the largest memory bucket.
+
+The current inference benchmark should be read using three numbers together:
+
+1. `resident_vram_mb`: memory already committed before decode
+2. `generation_overhead_mb`: memory added by decode-time work
+3. `paged_kv_cache`: whether BarqTrain's paged cache path was actually active
 
 The roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
@@ -317,6 +348,7 @@ barqtrain/
 │   └── barqtrain/
 │       ├── __init__.py
 │       ├── patch_models.py   # HF model patching
+│       ├── kv_cache.py       # Paged KV-cache integration
 │       ├── ops.py            # Custom ops wrappers
 │       ├── lora.py           # LoRA implementations
 │       └── data.py           # Rust data pipeline wrappers
@@ -326,6 +358,7 @@ barqtrain/
 │       ├── rmsnorm.cu        # Fused RMSNorm
 │       ├── flash_attention.cu # FlashAttention + RoPE
 │       ├── chunked_cross_entropy.cu # Chunked CE
+│       ├── paged_kv_cache.cu # Paged KV-cache append kernel
 │       └── lora.cu           # Fused LoRA GEMM
 ├── rust/                # Rust data pipeline
 │   └── src/lib.rs       # PyO3 bindings
