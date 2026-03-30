@@ -244,7 +244,7 @@ def _patch_generate_with_paged_kv(
     if not hasattr(model, "generate"):
         return model
 
-    from barqtrain.kv_cache import maybe_prepare_paged_kv_generate_kwargs, paged_kv_supported_for_model
+    from barqtrain.kv_cache import maybe_prepare_kv_generate_kwargs, paged_kv_supported_for_model
     from barqtrain.memory import (
         capture_cuda_peak_bytes,
         detailed_profiling_enabled,
@@ -266,7 +266,7 @@ def _patch_generate_with_paged_kv(
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
 
-        updated_kwargs, used_paged_kv = maybe_prepare_paged_kv_generate_kwargs(self, args, kwargs)
+        updated_kwargs, used_native_kv = maybe_prepare_kv_generate_kwargs(self, args, kwargs)
         updated_kwargs, used_last_token_logits = maybe_prepare_last_token_logits_generate_kwargs(
             self,
             args,
@@ -277,7 +277,10 @@ def _patch_generate_with_paged_kv(
         if detailed_profiling_enabled() and cache is not None:
             kv_cache_bytes = track_kv_cache_memory(cache)
 
-        setattr(self, "_barqtrain_last_generate_used_paged_kv", used_paged_kv)
+        cache_layout = getattr(cache, "barqtrain_cache_layout", None)
+        setattr(self, "_barqtrain_last_generate_used_paged_kv", used_native_kv and cache_layout == "paged")
+        setattr(self, "_barqtrain_last_generate_used_contiguous_kv", used_native_kv and cache_layout == "contiguous")
+        setattr(self, "_barqtrain_last_generate_kv_cache_layout", cache_layout)
         setattr(self, "_barqtrain_last_generate_last_token_logits_only", used_last_token_logits)
         setattr(self, "_barqtrain_last_generate_cache", cache)
 
@@ -303,8 +306,9 @@ def _patch_generate_with_paged_kv(
     model.generate = types.MethodType(generate, model)
     setattr(model, "_barqtrain_generate_paged_kv_patched", True)
     setattr(model, "_barqtrain_paged_kv_supported", paged_kv_supported_for_model(model))
+    setattr(model, "_barqtrain_supported_kv_cache_layouts", ("paged", "contiguous"))
     if getattr(model, "_barqtrain_paged_kv_supported", False):
-        print(f"BarqTrain: Enabled paged KV-cache injection for {model_label}")
+        print(f"BarqTrain: Enabled native KV-cache injection for {model_label}")
     print(f"BarqTrain: Enabled last-token decode logits specialization for {model_label}")
     return model
 

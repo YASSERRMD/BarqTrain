@@ -139,6 +139,46 @@ impl DecodeBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 2 KV-cache benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct KVCacheBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub prompt_length: usize,
+    #[pyo3(get)]
+    pub decode_length: usize,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub request_count: usize,
+    #[pyo3(get)]
+    pub fixed_vram_budget_mb: u64,
+}
+
+#[pymethods]
+impl KVCacheBenchmarkProfile {
+    #[new]
+    fn new(
+        name: String,
+        prompt_length: usize,
+        decode_length: usize,
+        batch_size: usize,
+        request_count: usize,
+        fixed_vram_budget_mb: u64,
+    ) -> Self {
+        Self {
+            name,
+            prompt_length,
+            decode_length,
+            batch_size,
+            request_count,
+            fixed_vram_budget_mb,
+        }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -257,6 +297,56 @@ fn phase1_decode_profiles(
             prompt_length: long_prompt_length,
             decode_length: short_decode_length,
             batch_size,
+        });
+    }
+    profiles
+}
+
+/// Emit the required Phase 2 contiguous-vs-paged KV benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    short_prompt_length=64,
+    long_prompt_length=1024,
+    short_decode_length=32,
+    long_decode_length=256,
+    serving_request_count=8,
+    fixed_vram_budget_mb=2048
+))]
+fn phase2_kv_cache_profiles(
+    batch_sizes: Vec<usize>,
+    short_prompt_length: usize,
+    long_prompt_length: usize,
+    short_decode_length: usize,
+    long_decode_length: usize,
+    serving_request_count: usize,
+    fixed_vram_budget_mb: u64,
+) -> Vec<KVCacheBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 3);
+    for batch_size in batch_sizes {
+        profiles.push(KVCacheBenchmarkProfile {
+            name: "long_prompt_generation".to_string(),
+            prompt_length: long_prompt_length,
+            decode_length: long_decode_length,
+            batch_size,
+            request_count: 1,
+            fixed_vram_budget_mb: 0,
+        });
+        profiles.push(KVCacheBenchmarkProfile {
+            name: "multi_request_serving".to_string(),
+            prompt_length: short_prompt_length,
+            decode_length: long_decode_length,
+            batch_size,
+            request_count: serving_request_count.max(1),
+            fixed_vram_budget_mb: 0,
+        });
+        profiles.push(KVCacheBenchmarkProfile {
+            name: "fixed_vram_batch_growth".to_string(),
+            prompt_length: long_prompt_length,
+            decode_length: short_decode_length,
+            batch_size,
+            request_count: 1,
+            fixed_vram_budget_mb,
         });
     }
     profiles
@@ -534,6 +624,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PackedCausalLMBatch>()?;
     m.add_class::<MemoryBreakdown>()?;
     m.add_class::<DecodeBenchmarkProfile>()?;
+    m.add_class::<KVCacheBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -542,5 +633,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(model_cuda_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(build_memory_breakdown, m)?)?;
     m.add_function(wrap_pyfunction!(phase1_decode_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase2_kv_cache_profiles, m)?)?;
     Ok(())
 }
