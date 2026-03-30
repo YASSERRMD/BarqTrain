@@ -196,7 +196,11 @@ def test_patch_generate_with_paged_kv_records_usage(monkeypatch):
         def generate(self, *args, **kwargs):
             return kwargs
 
-    monkeypatch.setattr("barqtrain.kv_cache.maybe_prepare_paged_kv_generate_kwargs", lambda model, args, kwargs: ({**kwargs, "sentinel": True}, True))
+    fake_cache = types.SimpleNamespace(barqtrain_cache_layout="paged")
+    monkeypatch.setattr(
+        "barqtrain.kv_cache.maybe_prepare_kv_generate_kwargs",
+        lambda model, args, kwargs: ({**kwargs, "sentinel": True, "past_key_values": fake_cache}, True),
+    )
     monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: True)
 
     model = DummyModel()
@@ -205,6 +209,8 @@ def test_patch_generate_with_paged_kv_records_usage(monkeypatch):
 
     assert result["sentinel"] is True
     assert model._barqtrain_last_generate_used_paged_kv is True
+    assert model._barqtrain_last_generate_used_contiguous_kv is False
+    assert model._barqtrain_last_generate_kv_cache_layout == "paged"
     assert model._barqtrain_paged_kv_supported is True
 
 
@@ -223,7 +229,7 @@ def test_patch_generate_records_last_token_logits_specialization(monkeypatch):
             return kwargs
 
     monkeypatch.setattr(
-        "barqtrain.kv_cache.maybe_prepare_paged_kv_generate_kwargs",
+        "barqtrain.kv_cache.maybe_prepare_kv_generate_kwargs",
         lambda model, args, kwargs: (kwargs, False),
     )
     monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: False)
@@ -269,7 +275,7 @@ def test_patch_generate_preserves_generation_parity_with_last_token_logits_only(
             return tokens
 
     monkeypatch.setattr(
-        "barqtrain.kv_cache.maybe_prepare_paged_kv_generate_kwargs",
+        "barqtrain.kv_cache.maybe_prepare_kv_generate_kwargs",
         lambda model, args, kwargs: (kwargs, False),
     )
     monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: False)
@@ -283,3 +289,33 @@ def test_patch_generate_preserves_generation_parity_with_last_token_logits_only(
 
     assert torch.equal(patched, baseline)
     assert patched_model._barqtrain_last_generate_last_token_logits_only is True
+
+
+def test_patch_generate_can_use_contiguous_kv_mode(monkeypatch):
+    import barqtrain.patch_models as patch_models
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = DummyConfig()
+
+        def forward(self, input_ids=None, logits_to_keep=None):
+            return logits_to_keep
+
+        def generate(self, *args, **kwargs):
+            return kwargs
+
+    fake_cache = types.SimpleNamespace(barqtrain_cache_layout="contiguous")
+    monkeypatch.setattr(
+        "barqtrain.kv_cache.maybe_prepare_kv_generate_kwargs",
+        lambda model, args, kwargs: ({**kwargs, "past_key_values": fake_cache}, True),
+    )
+    monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: True)
+
+    model = patch_models._patch_generate_with_paged_kv(DummyModel(), "Dummy")
+    result = model.generate(input_ids=torch.tensor([[1, 2, 3]]))
+
+    assert result["past_key_values"] is fake_cache
+    assert model._barqtrain_last_generate_used_paged_kv is False
+    assert model._barqtrain_last_generate_used_contiguous_kv is True
+    assert model._barqtrain_last_generate_kv_cache_layout == "contiguous"
