@@ -5,7 +5,9 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 use rayon::prelude::*;
+use std::collections::HashSet;
 
 /// Packed batch containing concatenated sequences with metadata
 #[pyclass]
@@ -68,6 +70,196 @@ impl PackedCausalLMBatch {
             labels,
         }
     }
+}
+
+/// Native memory breakdown emitted by the Rust benchmark/reporting helpers.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct MemoryBreakdown {
+    #[pyo3(get)]
+    pub resident_model_mb: f64,
+    #[pyo3(get)]
+    pub kv_cache_mb: f64,
+    #[pyo3(get)]
+    pub temporary_decode_buffers_mb: f64,
+    #[pyo3(get)]
+    pub training_peak_vram_mb: f64,
+    #[pyo3(get)]
+    pub inference_peak_vram_mb: f64,
+    #[pyo3(get)]
+    pub detailed_profiling: bool,
+}
+
+#[pymethods]
+impl MemoryBreakdown {
+    #[new]
+    fn new(
+        resident_model_mb: f64,
+        kv_cache_mb: f64,
+        temporary_decode_buffers_mb: f64,
+        training_peak_vram_mb: f64,
+        inference_peak_vram_mb: f64,
+        detailed_profiling: bool,
+    ) -> Self {
+        Self {
+            resident_model_mb,
+            kv_cache_mb,
+            temporary_decode_buffers_mb,
+            training_peak_vram_mb,
+            inference_peak_vram_mb,
+            detailed_profiling,
+        }
+    }
+}
+
+/// Canonical Phase 1 decode benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct DecodeBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub prompt_length: usize,
+    #[pyo3(get)]
+    pub decode_length: usize,
+    #[pyo3(get)]
+    pub batch_size: usize,
+}
+
+#[pymethods]
+impl DecodeBenchmarkProfile {
+    #[new]
+    fn new(name: String, prompt_length: usize, decode_length: usize, batch_size: usize) -> Self {
+        Self {
+            name,
+            prompt_length,
+            decode_length,
+            batch_size,
+        }
+    }
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn storage_nbytes(tensor: &PyAny) -> PyResult<Option<(usize, u64)>> {
+    let is_cuda = tensor.getattr("is_cuda")?.extract::<bool>()?;
+    if !is_cuda {
+        return Ok(None);
+    }
+
+    let storage = tensor
+        .call_method0("untyped_storage")
+        .or_else(|_| tensor.call_method0("storage"))?;
+    let storage_ptr = storage.call_method0("data_ptr")?.extract::<usize>()?;
+    let nbytes = storage
+        .call_method0("nbytes")
+        .and_then(|value| value.extract::<u64>())
+        .or_else(|_| {
+            let storage_size = storage.call_method0("size")?.extract::<u64>()?;
+            let element_size = tensor.call_method0("element_size")?.extract::<u64>()?;
+            Ok::<u64, PyErr>(storage_size.saturating_mul(element_size))
+        })?;
+
+    Ok(Some((storage_ptr, nbytes)))
+}
+
+fn accumulate_unique_cuda_bytes(iterable: &PyAny, seen: &mut HashSet<usize>) -> PyResult<u64> {
+    let mut total_bytes = 0u64;
+    for item in iterable.iter()? {
+        let tensor = item?;
+        if let Some((storage_ptr, nbytes)) = storage_nbytes(tensor)? {
+            if seen.insert(storage_ptr) {
+                total_bytes = total_bytes.saturating_add(nbytes);
+            }
+        }
+    }
+    Ok(total_bytes)
+}
+
+/// Measure the resident CUDA bytes owned by a model's parameters and buffers.
+#[pyfunction]
+fn model_cuda_bytes(model: &PyAny) -> PyResult<u64> {
+    let mut seen_storages = HashSet::new();
+    let mut total_bytes = 0u64;
+
+    if let Ok(parameters) = model.call_method0("parameters") {
+        total_bytes = total_bytes.saturating_add(accumulate_unique_cuda_bytes(
+            parameters,
+            &mut seen_storages,
+        )?);
+    }
+    if let Ok(buffers) = model.call_method0("buffers") {
+        total_bytes = total_bytes.saturating_add(accumulate_unique_cuda_bytes(
+            buffers,
+            &mut seen_storages,
+        )?);
+    }
+
+    Ok(total_bytes)
+}
+
+/// Build the canonical benchmark memory report from native byte counters.
+#[pyfunction]
+#[pyo3(signature = (
+    resident_model_bytes,
+    kv_cache_bytes,
+    temporary_decode_buffer_bytes,
+    training_peak_bytes,
+    inference_peak_bytes,
+    detailed_profiling=false
+))]
+fn build_memory_breakdown(
+    resident_model_bytes: u64,
+    kv_cache_bytes: u64,
+    temporary_decode_buffer_bytes: u64,
+    training_peak_bytes: u64,
+    inference_peak_bytes: u64,
+    detailed_profiling: bool,
+) -> MemoryBreakdown {
+    MemoryBreakdown {
+        resident_model_mb: bytes_to_mb(resident_model_bytes),
+        kv_cache_mb: bytes_to_mb(kv_cache_bytes),
+        temporary_decode_buffers_mb: bytes_to_mb(temporary_decode_buffer_bytes),
+        training_peak_vram_mb: bytes_to_mb(training_peak_bytes),
+        inference_peak_vram_mb: bytes_to_mb(inference_peak_bytes),
+        detailed_profiling,
+    }
+}
+
+/// Emit the required Phase 1 decode benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    short_prompt_length=64,
+    long_prompt_length=1024,
+    short_decode_length=32,
+    long_decode_length=256
+))]
+fn phase1_decode_profiles(
+    batch_sizes: Vec<usize>,
+    short_prompt_length: usize,
+    long_prompt_length: usize,
+    short_decode_length: usize,
+    long_decode_length: usize,
+) -> Vec<DecodeBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 2);
+    for batch_size in batch_sizes {
+        profiles.push(DecodeBenchmarkProfile {
+            name: "short_prompt_long_decode".to_string(),
+            prompt_length: short_prompt_length,
+            decode_length: long_decode_length,
+            batch_size,
+        });
+        profiles.push(DecodeBenchmarkProfile {
+            name: "long_prompt_short_decode".to_string(),
+            prompt_length: long_prompt_length,
+            decode_length: short_decode_length,
+            batch_size,
+        });
+    }
+    profiles
 }
 
 /// Pack sequences efficiently using bin-packing algorithm
@@ -340,10 +532,15 @@ fn create_prefetch_queue(batches: Vec<PackedBatch>) -> PrefetchQueue {
 fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PackedBatch>()?;
     m.add_class::<PackedCausalLMBatch>()?;
+    m.add_class::<MemoryBreakdown>()?;
+    m.add_class::<DecodeBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
     m.add_function(wrap_pyfunction!(parallel_tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(create_prefetch_queue, m)?)?;
+    m.add_function(wrap_pyfunction!(model_cuda_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(build_memory_breakdown, m)?)?;
+    m.add_function(wrap_pyfunction!(phase1_decode_profiles, m)?)?;
     Ok(())
 }

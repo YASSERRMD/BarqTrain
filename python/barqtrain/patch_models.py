@@ -237,7 +237,7 @@ def _patch_generate_with_paged_kv(
     model_label: str,
 ) -> torch.nn.Module:
     """
-    Wrap model.generate() to inject BarqTrain's paged KV cache on CUDA runs.
+    Wrap model.generate() to inject decode-time cache and logits optimizations.
     """
     if getattr(model, "_barqtrain_generate_paged_kv_patched", False):
         return model
@@ -245,19 +245,67 @@ def _patch_generate_with_paged_kv(
         return model
 
     from barqtrain.kv_cache import maybe_prepare_paged_kv_generate_kwargs, paged_kv_supported_for_model
+    from barqtrain.memory import (
+        capture_cuda_peak_bytes,
+        detailed_profiling_enabled,
+        maybe_prepare_last_token_logits_generate_kwargs,
+        record_inference_peak_bytes,
+        reset_native_memory_tracking,
+        track_decode_temp_memory,
+        track_kv_cache_memory,
+        track_resident_model_memory,
+    )
 
     original_generate = model.generate
 
     def generate(self, *args, **kwargs):
+        resident_model_bytes = 0
+        if detailed_profiling_enabled():
+            reset_native_memory_tracking(reset_peak=False)
+            resident_model_bytes = track_resident_model_memory(self)
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
         updated_kwargs, used_paged_kv = maybe_prepare_paged_kv_generate_kwargs(self, args, kwargs)
+        updated_kwargs, used_last_token_logits = maybe_prepare_last_token_logits_generate_kwargs(
+            self,
+            args,
+            updated_kwargs,
+        )
+        cache = updated_kwargs.get("past_key_values")
+        kv_cache_bytes = 0
+        if detailed_profiling_enabled() and cache is not None:
+            kv_cache_bytes = track_kv_cache_memory(cache)
+
         setattr(self, "_barqtrain_last_generate_used_paged_kv", used_paged_kv)
-        return original_generate(*args, **updated_kwargs)
+        setattr(self, "_barqtrain_last_generate_last_token_logits_only", used_last_token_logits)
+        setattr(self, "_barqtrain_last_generate_cache", cache)
+
+        result = original_generate(*args, **updated_kwargs)
+
+        if detailed_profiling_enabled():
+            inference_peak_bytes = capture_cuda_peak_bytes()
+            record_inference_peak_bytes(inference_peak_bytes)
+            if cache is not None:
+                kv_cache_bytes = track_kv_cache_memory(cache)
+            decode_temp_bytes = track_decode_temp_memory(
+                resident_model_bytes=resident_model_bytes,
+                kv_cache_bytes=kv_cache_bytes,
+                inference_peak_bytes=inference_peak_bytes,
+            )
+            setattr(self, "_barqtrain_last_generate_resident_model_bytes", resident_model_bytes)
+            setattr(self, "_barqtrain_last_generate_kv_cache_bytes", kv_cache_bytes)
+            setattr(self, "_barqtrain_last_generate_decode_temp_bytes", decode_temp_bytes)
+            setattr(self, "_barqtrain_last_generate_inference_peak_bytes", inference_peak_bytes)
+
+        return result
 
     model.generate = types.MethodType(generate, model)
     setattr(model, "_barqtrain_generate_paged_kv_patched", True)
     setattr(model, "_barqtrain_paged_kv_supported", paged_kv_supported_for_model(model))
     if getattr(model, "_barqtrain_paged_kv_supported", False):
         print(f"BarqTrain: Enabled paged KV-cache injection for {model_label}")
+    print(f"BarqTrain: Enabled last-token decode logits specialization for {model_label}")
     return model
 
 

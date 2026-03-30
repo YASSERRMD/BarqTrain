@@ -9,20 +9,22 @@
 - **FlashAttention Integration**: `patch_model(...)` selects `flash_attention_2` when available and falls back to PyTorch SDPA otherwise
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
-- **Paged KV Cache**: CUDA-backed paged cache append path that avoids `torch.cat` cache growth during generation
+- **Native Memory Accounting**: Rust/CUDA benchmark reporting splits resident model memory, KV-cache memory, decode scratch memory, training peak VRAM, and inference peak VRAM
+- **Paged KV Cache Append Path**: CUDA-backed paged cache append path that avoids `torch.cat` cache growth during generation
 - **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
 
 ## Current Status
 
 BarqTrain is already a useful native acceleration layer, but it is not yet a full native memory-management stack for LLM serving.
 
-| Area | Native Status Today | Primary Benefit Today | Biggest Missing Piece |
-|------|----------------------|-----------------------|-----------------------|
+| Area | Shipped Today | Benefit Today | Roadmap Next |
+|------|---------------|---------------|--------------|
 | RMSNorm | CUDA kernel shipped | lower kernel overhead | deeper fusion into larger blocks |
 | Cross-entropy | CUDA chunked loss shipped | lower training memory and better training throughput | more fused projection-plus-loss work |
 | Data path | Rust packing shipped | lower Python overhead and less padding waste | padding-free end-to-end training path |
 | Attention | backend selection shipped | faster attention when FlashAttention is available | deeper native attention fusion |
-| Inference memory | phase 1+2 shipped | resident/peak accounting plus paged KV-cache generation | quantized/offloaded KV-cache and page-table compaction |
+| Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | full paged allocator, block recycling, and quantized/offloaded cache modes |
+| KV cache implementation | append path shipped | avoids `torch.cat` growth during decode | page tables, gather/scatter kernels, and recycler/free-list management |
 | Optimizer memory | wrapper-level | optional training-memory savings | native optimizer-state control |
 
 ## Research-Backed Roadmap
@@ -347,23 +349,28 @@ trainer.train()
 BarqTrain should be evaluated in two separate ways:
 
 - **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
-- **Inference path**: the current native stack now measures resident VRAM separately and ships a paged KV cache for decode-time cache growth, but total peak VRAM on short full-weight runs can still be dominated by model residency.
+- **Inference path**: Phase 1 now reports memory buckets separately so decode cleanup can be judged against the right numbers instead of a single combined VRAM total.
 
-That distinction matters. A faster inference benchmark does not automatically mean lower total VRAM if model weights remain the largest memory bucket.
+The shipped Phase 1 benchmark reports these memory buckets explicitly:
 
-The current inference benchmark now runs two profiles:
+1. `resident_model_mb`
+2. `kv_cache_mb`
+3. `temporary_decode_buffers_mb`
+4. `training_peak_vram_mb`
+5. `inference_peak_vram_mb`
 
-1. `throughput_short`: short prompt + short decode
-2. `memory_long`: long prompt + longer decode to stress KV-cache growth
+The shipped inference matrix now covers:
 
-The current inference benchmark should be read using these numbers together:
+1. `short_prompt_long_decode`
+2. `long_prompt_short_decode`
+3. batch sizes `1`, `4`, and `8`
 
-1. `resident_vram_mb`: memory already committed before decode
-2. `generation_overhead_mb`: memory added by decode-time work
-3. `paged_kv_cache`: whether BarqTrain's paged cache path was actually active
-4. `last_token_logits_only`: whether decode-token logits-only generation was requested
+The decode report also records:
 
-The roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
+1. `paged_kv_cache`
+2. `last_token_logits_only`
+
+The current roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
 1. native memory accounting
 2. paged KV-cache
@@ -371,6 +378,37 @@ The roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore priori
 4. fused projection-plus-loss improvements
 5. padding-free packed training
 6. activation-memory control
+
+Example Phase 1 report shape:
+
+```json
+{
+  "training": {
+    "memory": {
+      "resident_model_mb": 0.0,
+      "kv_cache_mb": 0.0,
+      "temporary_decode_buffers_mb": 0.0,
+      "training_peak_vram_mb": 0.0,
+      "inference_peak_vram_mb": 0.0
+    }
+  },
+  "inference_profiles": [
+    {
+      "profile_name": "short_prompt_long_decode",
+      "batch_size": 1,
+      "paged_kv_cache": false,
+      "last_token_logits_only": true,
+      "memory": {
+        "resident_model_mb": 0.0,
+        "kv_cache_mb": 0.0,
+        "temporary_decode_buffers_mb": 0.0,
+        "training_peak_vram_mb": 0.0,
+        "inference_peak_vram_mb": 0.0
+      }
+    }
+  ]
+}
+```
 
 ## Architecture
 
@@ -415,11 +453,16 @@ barqtrain/
 pytest tests/test_rmsnorm.py -v
 
 # Run benchmarks
-python -m barqtrain.benchmarks.baseline --model tinyllama --steps 100
+python -m barqtrain.benchmarks.baseline \
+  --model tinyllama \
+  --mode both \
+  --steps 100 \
+  --detailed-profiling
 
 # Benchmark Rust packing + paged optimizer
 python -m barqtrain.benchmarks.baseline \
   --model tinyllama \
+  --mode training \
   --steps 100 \
   --use-packing \
   --optimizer paged_adamw_32bit
