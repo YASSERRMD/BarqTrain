@@ -279,6 +279,7 @@ def _patch_generate_with_paged_kv(
 
         setattr(self, "_barqtrain_last_generate_used_paged_kv", used_paged_kv)
         setattr(self, "_barqtrain_last_generate_last_token_logits_only", used_last_token_logits)
+        setattr(self, "_barqtrain_last_generate_cache", cache)
 
         result = original_generate(*args, **updated_kwargs)
 
