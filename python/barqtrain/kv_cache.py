@@ -36,7 +36,9 @@ def _min_paged_kv_cache_len() -> int:
 
 def _kv_cache_mode(default: str = "auto") -> str:
     mode = os.environ.get("BARQTRAIN_KV_CACHE_MODE", default).strip().lower()
-    if mode not in {"auto", "paged", "contiguous"}:
+    if mode == "quantized":
+        mode = "paged_quantized"
+    if mode not in {"auto", "paged", "contiguous", "paged_quantized"}:
         raise ValueError(f"Unsupported BARQTRAIN_KV_CACHE_MODE={mode!r}")
     return mode
 
@@ -52,6 +54,15 @@ def _logical_block_count(length: int, page_size: int) -> int:
     if length <= 0:
         return 0
     return math.ceil(length / page_size)
+
+
+def _quantized_residual_window_tokens() -> int:
+    return int(os.environ.get("BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS", "128"))
+
+
+def _quantized_residual_window_blocks(page_size: int, residual_window_tokens: Optional[int] = None) -> int:
+    tokens = _quantized_residual_window_tokens() if residual_window_tokens is None else int(residual_window_tokens)
+    return max(_logical_block_count(tokens, page_size), 1)
 
 
 class BarqPagedKVCacheLayer(CacheLayerMixin):
@@ -390,6 +401,426 @@ class BarqPagedKVCache(Cache):
         return sum(layer.resident_blocks() for layer in self.layers)
 
 
+class BarqQuantizedPagedKVCacheLayer(BarqPagedKVCacheLayer):
+    """A paged KV cache that quantizes older blocks while keeping a recent FP residual window."""
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_cache_len: int,
+        page_size: int = 16,
+        total_blocks: Optional[int] = None,
+        residual_window_tokens: Optional[int] = None,
+    ):
+        super().__init__(
+            max_batch_size=max_batch_size,
+            max_cache_len=max_cache_len,
+            page_size=page_size,
+            total_blocks=total_blocks,
+        )
+        self.residual_window_tokens = (
+            _quantized_residual_window_tokens()
+            if residual_window_tokens is None
+            else int(residual_window_tokens)
+        )
+        self.residual_window_blocks = _quantized_residual_window_blocks(
+            self.page_size,
+            self.residual_window_tokens,
+        )
+        self.total_residual_slots = max(self.max_batch_size * self.residual_window_blocks, 1)
+        self._free_residual_slots: list[int] = []
+
+    def lazy_initialization(self, key_states: torch.Tensor):
+        if key_states.dim() != 4:
+            raise ValueError("key_states must have shape [batch, kv_heads, seq, head_dim]")
+
+        batch_size, num_kv_heads, _, head_dim = key_states.shape
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"batch_size={batch_size} exceeds max_batch_size={self.max_batch_size} for quantized paged KV cache"
+            )
+
+        self.device = key_states.device
+        self.dtype = key_states.dtype
+        self.current_batch_size = batch_size
+        self.quantized_keys = torch.zeros(
+            (self.total_blocks, num_kv_heads, self.page_size, head_dim),
+            dtype=torch.int8,
+            device=self.device,
+        )
+        self.quantized_values = torch.zeros_like(self.quantized_keys)
+        self.residual_keys = torch.zeros(
+            (self.total_residual_slots, num_kv_heads, self.page_size, head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.residual_values = torch.zeros_like(self.residual_keys)
+        self.key_scales = torch.ones(
+            (self.total_blocks, num_kv_heads),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.value_scales = torch.ones_like(self.key_scales)
+        self.seq_lens = torch.zeros((self.max_batch_size,), dtype=torch.int32, device=self.device)
+        self.page_table = torch.full(
+            (self.max_batch_size, self.max_blocks),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.residual_page_table = torch.full_like(self.page_table, -1)
+        self.physical_block_to_residual_slot = torch.full(
+            (self.total_blocks,),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._free_blocks = list(range(self.total_blocks))
+        self._free_residual_slots = list(range(self.total_residual_slots))
+        self.is_initialized = True
+
+    def _allocate_residual_slot(self, batch_idx: int, logical_block: int) -> None:
+        slot = int(self.residual_page_table[batch_idx, logical_block].item())
+        if slot >= 0:
+            return
+        if not self._free_residual_slots:
+            raise ValueError(
+                "quantized paged KV residual window exhausted: no free residual slots remain "
+                f"(max_batch_size={self.max_batch_size}, residual_window_blocks={self.residual_window_blocks})"
+            )
+        physical_block = int(self.page_table[batch_idx, logical_block].item())
+        if physical_block < 0:
+            raise ValueError("page table entry missing while assigning residual slot")
+        slot = self._free_residual_slots.pop()
+        self.residual_page_table[batch_idx, logical_block] = slot
+        self.physical_block_to_residual_slot[physical_block] = slot
+
+    def _free_residual_slot(self, batch_idx: int, logical_block: int) -> None:
+        slot = int(self.residual_page_table[batch_idx, logical_block].item())
+        if slot < 0:
+            return
+        physical_block = int(self.page_table[batch_idx, logical_block].item())
+        self.residual_page_table[batch_idx, logical_block] = -1
+        if physical_block >= 0:
+            self.physical_block_to_residual_slot[physical_block] = -1
+        self.residual_keys[slot].zero_()
+        self.residual_values[slot].zero_()
+        self._free_residual_slots.append(slot)
+
+    def _free_block(self, batch_idx: int, logical_block: int) -> None:
+        self._free_residual_slot(batch_idx, logical_block)
+        super()._free_block(batch_idx, logical_block)
+
+    @staticmethod
+    def _quantize_tensor(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scales = block.abs().amax(dim=(1, 2)).clamp_min(1e-8) / 127.0
+        quantized = torch.clamp(
+            torch.round(block.float() / scales.view(-1, 1, 1)),
+            min=-127,
+            max=127,
+        ).to(torch.int8)
+        return quantized, scales
+
+    def _quantize_logical_block(self, batch_idx: int, logical_block: int) -> None:
+        physical_block = int(self.page_table[batch_idx, logical_block].item())
+        slot = int(self.residual_page_table[batch_idx, logical_block].item())
+        if physical_block < 0 or slot < 0:
+            return
+
+        quantized_keys, key_scales = self._quantize_tensor(self.residual_keys[slot])
+        quantized_values, value_scales = self._quantize_tensor(self.residual_values[slot])
+        self.quantized_keys[physical_block] = quantized_keys
+        self.quantized_values[physical_block] = quantized_values
+        self.key_scales[physical_block] = key_scales
+        self.value_scales[physical_block] = value_scales
+        self._free_residual_slot(batch_idx, logical_block)
+
+    def _quantize_stale_blocks(self, future_token_count: int = 0) -> None:
+        for batch_idx in range(self.current_batch_size):
+            seq_len = int(self.seq_lens[batch_idx].item()) + int(future_token_count)
+            active_blocks = _logical_block_count(seq_len, self.page_size)
+            residual_cutoff = max(active_blocks - self.residual_window_blocks, 0)
+            for logical_block in range(residual_cutoff):
+                if int(self.residual_page_table[batch_idx, logical_block].item()) >= 0:
+                    self._quantize_logical_block(batch_idx, logical_block)
+
+    def _ensure_residual_assignments(self, batch_size: int, token_count: int) -> None:
+        for batch_idx in range(batch_size):
+            start = int(self.seq_lens[batch_idx].item())
+            end = start + token_count
+            first_block = start // self.page_size
+            last_block = (end - 1) // self.page_size if token_count > 0 else first_block
+            for logical_block in range(first_block, last_block + 1):
+                self._allocate_residual_slot(batch_idx, logical_block)
+
+    def _python_assign_batch(self, batch_idx: int, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        _, token_count, _ = key_states.shape
+        start = int(self.seq_lens[batch_idx].item())
+        end = start + token_count
+        if end > self.max_cache_len:
+            raise ValueError(
+                f"quantized paged KV cache capacity exceeded: requested {end}, max_cache_len={self.max_cache_len}"
+            )
+        for token_idx in range(token_count):
+            absolute_pos = start + token_idx
+            logical_block = absolute_pos // self.page_size
+            page_offset = absolute_pos % self.page_size
+            residual_slot = int(self.residual_page_table[batch_idx, logical_block].item())
+            if residual_slot < 0:
+                raise ValueError("residual page table entry missing during quantized KV append")
+            self.residual_keys[residual_slot, :, page_offset, :] = key_states[:, token_idx, :]
+            self.residual_values[residual_slot, :, page_offset, :] = value_states[:, token_idx, :]
+        self.seq_lens[batch_idx] = end  # type: ignore[index]
+
+    def append(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        if not self.is_initialized:
+            self.lazy_initialization(key_states)
+
+        if key_states.shape != value_states.shape:
+            raise ValueError("key_states and value_states must have identical shapes")
+        if key_states.device != self.device or value_states.device != self.device:
+            raise ValueError("key_states and value_states must stay on the cache device")
+        if key_states.dtype != self.dtype or value_states.dtype != self.dtype:
+            raise ValueError("key_states and value_states must stay in the cache dtype")
+        if key_states.size(0) > self.max_batch_size:
+            raise ValueError("batch size exceeds the configured quantized paged KV cache capacity")
+
+        self._ensure_page_assignments(key_states.size(0), key_states.size(2))
+        self._quantize_stale_blocks(future_token_count=key_states.size(2))
+        self._ensure_residual_assignments(key_states.size(0), key_states.size(2))
+
+        backend = _get_cuda_backend()
+        if backend is not None and key_states.is_cuda:
+            backend.paged_kv_append_(
+                self.residual_keys,
+                self.residual_values,
+                self.residual_page_table,
+                self.seq_lens,
+                key_states.contiguous(),
+                value_states.contiguous(),
+            )
+            self.current_batch_size = key_states.size(0)
+            self._quantize_stale_blocks()
+            return
+
+        for batch_idx in range(key_states.size(0)):
+            self._python_assign_batch(
+                batch_idx,
+                key_states[batch_idx].contiguous(),
+                value_states[batch_idx].contiguous(),
+            )
+        self.current_batch_size = key_states.size(0)
+        self._quantize_stale_blocks()
+
+    def _python_gather(
+        self,
+        quantized_cache: torch.Tensor,
+        residual_cache: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = self.current_batch_size
+        seq_len = self.get_seq_length()
+        if batch_size == 0 or seq_len == 0:
+            return torch.zeros(
+                (batch_size, residual_cache.size(1), seq_len, residual_cache.size(-1)),
+                dtype=residual_cache.dtype,
+                device=residual_cache.device,
+            )
+
+        output = torch.zeros(
+            (batch_size, residual_cache.size(1), seq_len, residual_cache.size(-1)),
+            dtype=residual_cache.dtype,
+            device=residual_cache.device,
+        )
+        for batch_idx in range(batch_size):
+            seq_len_batch = int(self.seq_lens[batch_idx].item())
+            for token_idx in range(seq_len_batch):
+                logical_block = token_idx // self.page_size
+                page_offset = token_idx % self.page_size
+                residual_slot = int(self.residual_page_table[batch_idx, logical_block].item())
+                if residual_slot >= 0:
+                    output[batch_idx, :, token_idx, :] = residual_cache[residual_slot, :, page_offset, :]
+                    continue
+                physical_block = int(self.page_table[batch_idx, logical_block].item())
+                if physical_block < 0:
+                    continue
+                output[batch_idx, :, token_idx, :] = (
+                    quantized_cache[physical_block, :, page_offset, :].float()
+                    * scales[physical_block].view(-1, 1)
+                ).to(output.dtype)
+        return output
+
+    def current_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_initialized:
+            raise ValueError("quantized paged KV cache is not initialized")
+        backend = _get_cuda_backend()
+        if backend is not None and self.residual_keys.is_cuda and hasattr(backend, "paged_kv_gather_quantized"):
+            keys = backend.paged_kv_gather_quantized(
+                self.quantized_keys,
+                self.residual_keys,
+                self.key_scales,
+                self.page_table,
+                self.residual_page_table,
+                self.seq_lens,
+            )
+            values = backend.paged_kv_gather_quantized(
+                self.quantized_values,
+                self.residual_values,
+                self.value_scales,
+                self.page_table,
+                self.residual_page_table,
+                self.seq_lens,
+            )
+        else:
+            keys = self._python_gather(self.quantized_keys, self.residual_keys, self.key_scales)
+            values = self._python_gather(self.quantized_values, self.residual_values, self.value_scales)
+        return keys, values
+
+    def quantized_blocks(self) -> int:
+        quantized = 0
+        for batch_idx in range(self.current_batch_size):
+            seq_len = int(self.seq_lens[batch_idx].item())
+            active_blocks = _logical_block_count(seq_len, self.page_size)
+            for logical_block in range(active_blocks):
+                if int(self.residual_page_table[batch_idx, logical_block].item()) < 0:
+                    quantized += 1
+        return quantized
+
+    def crop(self, max_length: int) -> None:
+        if not self.is_initialized or self.seq_lens is None:
+            return
+        if max_length < 0:
+            max_length = self.get_seq_length() - abs(max_length)
+        max_length = max(max_length, 0)
+        keys, values = self.current_tensors()
+        seq_lens = [
+            min(int(self.seq_lens[batch_idx].item()), max_length)
+            for batch_idx in range(self.current_batch_size)
+        ]
+        self._rebuild_from_contiguous(keys, values, seq_lens)
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        if not self.is_initialized or self.current_batch_size == 0:
+            return
+        keys, values = self.current_tensors()
+        seq_lens = [
+            int(self.seq_lens[batch_idx].item())
+            for batch_idx in range(self.current_batch_size)
+            for _ in range(repeats)
+        ]
+        self._rebuild_from_contiguous(
+            keys.repeat_interleave(repeats, dim=0),
+            values.repeat_interleave(repeats, dim=0),
+            seq_lens,
+        )
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        if not self.is_initialized or self.current_batch_size == 0:
+            return
+        indices_cpu = [int(value) for value in indices.view(-1).tolist()]
+        keys, values = self.current_tensors()
+        selected = torch.tensor(indices_cpu, device=keys.device)
+        seq_lens = [int(self.seq_lens[idx].item()) for idx in indices_cpu]
+        self._rebuild_from_contiguous(
+            keys.index_select(0, selected),
+            values.index_select(0, selected),
+            seq_lens,
+        )
+
+    def _rebuild_from_contiguous(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        seq_lens: list[int],
+    ) -> None:
+        self.reset()
+        self.current_batch_size = len(seq_lens)
+        for batch_idx, seq_len in enumerate(seq_lens):
+            if seq_len == 0:
+                continue
+            last_block = _logical_block_count(seq_len, self.page_size)
+            for logical_block in range(last_block):
+                self._allocate_block(batch_idx, logical_block)
+                self._allocate_residual_slot(batch_idx, logical_block)
+            self._python_assign_batch(
+                batch_idx,
+                keys[batch_idx, :, :seq_len, :],
+                values[batch_idx, :, :seq_len, :],
+            )
+        self._quantize_stale_blocks()
+
+    def reset(self) -> None:
+        if not self.is_initialized:
+            return
+        self.quantized_keys.zero_()
+        self.quantized_values.zero_()
+        self.residual_keys.zero_()
+        self.residual_values.zero_()
+        self.key_scales.fill_(1.0)
+        self.value_scales.fill_(1.0)
+        self.seq_lens.zero_()
+        self.page_table.fill_(-1)
+        self.residual_page_table.fill_(-1)
+        self.physical_block_to_residual_slot.fill_(-1)
+        self._free_blocks = list(range(self.total_blocks))
+        self._free_residual_slots = list(range(self.total_residual_slots))
+        self.current_batch_size = 0
+
+
+class BarqQuantizedPagedKVCache(Cache):
+    """A paged KV cache that quantizes older pages and keeps a recent residual FP window."""
+
+    def __init__(
+        self,
+        config,
+        max_batch_size: int,
+        max_cache_len: int,
+        page_size: int = 16,
+        total_blocks: Optional[int] = None,
+        residual_window_tokens: Optional[int] = None,
+    ):
+        decoder_config = _decoder_config(config)
+        num_layers = decoder_config.num_hidden_layers
+        if hasattr(decoder_config, "num_kv_shared_layers"):
+            num_layers -= decoder_config.num_kv_shared_layers
+
+        layers = [
+            BarqQuantizedPagedKVCacheLayer(
+                max_batch_size=max_batch_size,
+                max_cache_len=max_cache_len,
+                page_size=page_size,
+                total_blocks=total_blocks,
+                residual_window_tokens=residual_window_tokens,
+            )
+            for _ in range(num_layers)
+        ]
+        super().__init__(layers=layers)
+        self.page_size = page_size
+        self.barqtrain_max_cache_len = max_cache_len
+        self.barqtrain_max_batch_size = max_batch_size
+        self.barqtrain_total_blocks = total_blocks or _default_total_paged_blocks(
+            max_batch_size,
+            math.ceil(max_cache_len / page_size),
+        )
+        self.barqtrain_residual_window_tokens = (
+            _quantized_residual_window_tokens()
+            if residual_window_tokens is None
+            else int(residual_window_tokens)
+        )
+        self.barqtrain_cache_layout = "paged_quantized"
+
+    def fragmentation_ratio(self) -> float:
+        if not self.layers:
+            return 0.0
+        return sum(layer.fragmentation_ratio() for layer in self.layers) / len(self.layers)
+
+    def resident_blocks(self) -> int:
+        return sum(layer.resident_blocks() for layer in self.layers)
+
+    def quantized_blocks(self) -> int:
+        return sum(layer.quantized_blocks() for layer in self.layers)
+
+
 class BarqContiguousKVCacheLayer(CacheLayerMixin):
     """A fixed-capacity contiguous KV-cache fallback."""
 
@@ -559,6 +990,27 @@ def create_paged_kv_cache(
     )
 
 
+def create_quantized_paged_kv_cache(
+    model_or_config,
+    *,
+    max_batch_size: int,
+    max_cache_len: int,
+    page_size: int = 16,
+    total_blocks: Optional[int] = None,
+    residual_window_tokens: Optional[int] = None,
+) -> BarqQuantizedPagedKVCache:
+    """Create a paged KV cache with quantized older pages and a recent FP residual window."""
+    config = getattr(model_or_config, "config", model_or_config)
+    return BarqQuantizedPagedKVCache(
+        config=config,
+        max_batch_size=max_batch_size,
+        max_cache_len=max_cache_len,
+        page_size=page_size,
+        total_blocks=total_blocks,
+        residual_window_tokens=residual_window_tokens,
+    )
+
+
 def create_contiguous_kv_cache(
     model_or_config,
     *,
@@ -584,6 +1036,7 @@ def create_kv_cache(
     mode: str = "paged",
 ):
     """Create a paged or contiguous KV cache."""
+    mode = "paged_quantized" if mode == "quantized" else mode
     if mode == "paged":
         return create_paged_kv_cache(
             model_or_config,
@@ -591,6 +1044,20 @@ def create_kv_cache(
             max_cache_len=max_cache_len,
             page_size=page_size,
             total_blocks=total_blocks,
+        )
+    if mode == "paged_quantized":
+        return create_quantized_paged_kv_cache(
+            model_or_config,
+            max_batch_size=max_batch_size,
+            max_cache_len=max_cache_len,
+            page_size=page_size,
+            total_blocks=total_blocks,
+            residual_window_tokens=int(
+                os.environ.get(
+                    "BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS",
+                    str(_quantized_residual_window_tokens()),
+                )
+            ),
         )
     if mode == "contiguous":
         return create_contiguous_kv_cache(
@@ -694,9 +1161,12 @@ __all__ = [
     "BarqContiguousKVCacheLayer",
     "BarqPagedKVCache",
     "BarqPagedKVCacheLayer",
+    "BarqQuantizedPagedKVCache",
+    "BarqQuantizedPagedKVCacheLayer",
     "create_contiguous_kv_cache",
     "create_kv_cache",
     "create_paged_kv_cache",
+    "create_quantized_paged_kv_cache",
     "maybe_prepare_kv_generate_kwargs",
     "maybe_prepare_paged_kv_generate_kwargs",
     "paged_kv_supported_for_model",

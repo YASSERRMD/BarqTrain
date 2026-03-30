@@ -9,8 +9,11 @@ from barqtrain.kv_cache import (
     BarqContiguousKVCache,
     BarqPagedKVCache,
     BarqPagedKVCacheLayer,
+    BarqQuantizedPagedKVCache,
+    BarqQuantizedPagedKVCacheLayer,
     create_contiguous_kv_cache,
     create_kv_cache,
+    create_quantized_paged_kv_cache,
     maybe_prepare_kv_generate_kwargs,
     create_paged_kv_cache,
     maybe_prepare_paged_kv_generate_kwargs,
@@ -80,12 +83,66 @@ def test_create_contiguous_kv_cache_uses_decoder_layer_count():
     assert cache.barqtrain_max_cache_len == 64
 
 
+def test_create_quantized_paged_kv_cache_uses_decoder_layer_count():
+    cache = create_quantized_paged_kv_cache(
+        DummyConfig(),
+        max_batch_size=2,
+        max_cache_len=64,
+        page_size=16,
+        residual_window_tokens=16,
+    )
+
+    assert isinstance(cache, BarqQuantizedPagedKVCache)
+    assert len(cache.layers) == 3
+    assert cache.barqtrain_max_batch_size == 2
+    assert cache.barqtrain_max_cache_len == 64
+    assert cache.barqtrain_residual_window_tokens == 16
+    assert cache.barqtrain_cache_layout == "paged_quantized"
+
+
 def test_create_kv_cache_respects_mode():
     paged = create_kv_cache(DummyConfig(), max_batch_size=1, max_cache_len=32, mode="paged")
     contiguous = create_kv_cache(DummyConfig(), max_batch_size=1, max_cache_len=32, mode="contiguous")
+    quantized = create_kv_cache(DummyConfig(), max_batch_size=1, max_cache_len=32, mode="paged_quantized")
 
     assert isinstance(paged, BarqPagedKVCache)
     assert isinstance(contiguous, BarqContiguousKVCache)
+    assert isinstance(quantized, BarqQuantizedPagedKVCache)
+
+
+def test_quantized_paged_kv_layer_quantizes_older_blocks():
+    layer = BarqQuantizedPagedKVCacheLayer(
+        max_batch_size=1,
+        max_cache_len=8,
+        page_size=2,
+        total_blocks=4,
+        residual_window_tokens=2,
+    )
+
+    first_keys = torch.tensor(
+        [[[[0.25, -0.50], [0.75, -1.00]]]],
+        dtype=torch.float32,
+    )
+    first_values = first_keys + 0.125
+    second_keys = torch.tensor(
+        [[[[0.50, -0.25], [0.90, -0.60]]]],
+        dtype=torch.float32,
+    )
+    second_values = second_keys - 0.125
+
+    layer.update(first_keys, first_values)
+    assert layer.quantized_blocks() == 0
+    assert int(layer.residual_page_table[0, 0].item()) >= 0
+
+    keys, values = layer.update(second_keys, second_values)
+
+    assert layer.quantized_blocks() == 1
+    assert int(layer.residual_page_table[0, 0].item()) == -1
+    assert int(layer.residual_page_table[0, 1].item()) >= 0
+    assert torch.allclose(keys[:, :, :2, :], first_keys, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(values[:, :, :2, :], first_values, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(keys[:, :, 2:, :], second_keys, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(values[:, :, 2:, :], second_values, atol=1e-5, rtol=1e-5)
 
 
 def test_maybe_prepare_paged_kv_generate_kwargs_injects_cache(monkeypatch):
@@ -133,6 +190,30 @@ def test_maybe_prepare_kv_generate_kwargs_can_use_contiguous_mode(monkeypatch):
     assert used is True
     assert isinstance(updated_kwargs["past_key_values"], BarqContiguousKVCache)
     assert updated_kwargs["past_key_values"].barqtrain_cache_layout == "contiguous"
+
+
+def test_maybe_prepare_kv_generate_kwargs_can_use_quantized_mode(monkeypatch):
+    monkeypatch.setattr("barqtrain.kv_cache._get_cuda_backend", lambda: None)
+    monkeypatch.setenv("BARQTRAIN_KV_CACHE_MODE", "paged_quantized")
+    monkeypatch.setenv("BARQTRAIN_PAGED_KV_MIN_CACHE_LEN", "0")
+    monkeypatch.setenv("BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS", "16")
+
+    model = types.SimpleNamespace(
+        config=DummyConfig(),
+        generation_config=types.SimpleNamespace(max_new_tokens=None, max_length=32),
+        _barqtrain_paged_kv_supported=True,
+    )
+    fake_input_ids = types.SimpleNamespace(shape=(1, 8), device=torch.device("cuda"))
+
+    updated_kwargs, used = maybe_prepare_kv_generate_kwargs(
+        model,
+        (),
+        {"input_ids": fake_input_ids, "max_new_tokens": 4},
+    )
+
+    assert used is True
+    assert isinstance(updated_kwargs["past_key_values"], BarqQuantizedPagedKVCache)
+    assert updated_kwargs["past_key_values"].barqtrain_cache_layout == "paged_quantized"
 
 
 def test_maybe_prepare_paged_kv_generate_kwargs_skips_short_decode(monkeypatch):
@@ -320,6 +401,36 @@ def test_patch_generate_can_use_contiguous_kv_mode(monkeypatch):
     assert model._barqtrain_last_generate_used_paged_kv is False
     assert model._barqtrain_last_generate_used_contiguous_kv is True
     assert model._barqtrain_last_generate_kv_cache_layout == "contiguous"
+
+
+def test_patch_generate_can_use_quantized_kv_mode(monkeypatch):
+    import barqtrain.patch_models as patch_models
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = DummyConfig()
+
+        def forward(self, input_ids=None, logits_to_keep=None):
+            return logits_to_keep
+
+        def generate(self, *args, **kwargs):
+            return kwargs
+
+    fake_cache = types.SimpleNamespace(barqtrain_cache_layout="paged_quantized")
+    monkeypatch.setattr(
+        "barqtrain.kv_cache.maybe_prepare_kv_generate_kwargs",
+        lambda model, args, kwargs: ({**kwargs, "past_key_values": fake_cache}, True),
+    )
+    monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: True)
+
+    model = patch_models._patch_generate_with_paged_kv(DummyModel(), "Dummy")
+    result = model.generate(input_ids=torch.tensor([[1, 2, 3]]))
+
+    assert result["past_key_values"] is fake_cache
+    assert model._barqtrain_last_generate_used_quantized_kv is True
+    assert model._barqtrain_last_generate_kv_cache_layout == "paged_quantized"
+    assert "paged_quantized" in model._barqtrain_supported_kv_cache_layouts
 
 
 def test_patch_generate_preserves_generation_parity_across_kv_layouts(monkeypatch):

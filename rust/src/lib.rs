@@ -352,6 +352,52 @@ fn phase2_kv_cache_profiles(
     profiles
 }
 
+/// Emit the required Phase 3 quantized KV benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    short_prompt_length=64,
+    long_prompt_length=1024,
+    quality_decode_length=64,
+    long_decode_length=256
+))]
+fn phase3_quantized_kv_profiles(
+    batch_sizes: Vec<usize>,
+    short_prompt_length: usize,
+    long_prompt_length: usize,
+    quality_decode_length: usize,
+    long_decode_length: usize,
+) -> Vec<KVCacheBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 3);
+    for batch_size in batch_sizes {
+        profiles.push(KVCacheBenchmarkProfile {
+            name: "memory_savings_vs_latency".to_string(),
+            prompt_length: long_prompt_length,
+            decode_length: long_decode_length,
+            batch_size,
+            request_count: 1,
+            fixed_vram_budget_mb: 0,
+        });
+        profiles.push(KVCacheBenchmarkProfile {
+            name: "long_context_generation_quality".to_string(),
+            prompt_length: long_prompt_length,
+            decode_length: quality_decode_length,
+            batch_size,
+            request_count: 1,
+            fixed_vram_budget_mb: 0,
+        });
+        profiles.push(KVCacheBenchmarkProfile {
+            name: "throughput_per_gb".to_string(),
+            prompt_length: short_prompt_length,
+            decode_length: long_decode_length,
+            batch_size,
+            request_count: 1,
+            fixed_vram_budget_mb: 0,
+        });
+    }
+    profiles
+}
+
 /// Pack sequences efficiently using bin-packing algorithm
 ///
 /// This implements a first-fit decreasing algorithm for efficient
@@ -634,5 +680,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_memory_breakdown, m)?)?;
     m.add_function(wrap_pyfunction!(phase1_decode_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase2_kv_cache_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase3_quantized_kv_profiles, m)?)?;
     Ok(())
 }

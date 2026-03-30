@@ -10,7 +10,7 @@
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
 - **Native Memory Accounting**: Rust/CUDA benchmark reporting splits resident model memory, KV-cache memory, decode scratch memory, training peak VRAM, and inference peak VRAM
-- **Paged KV Cache**: CUDA-backed allocator, page table, gather/scatter path, and recycler/free-list management with a contiguous fallback mode
+- **Paged and Quantized KV Cache**: CUDA-backed allocator, page table, gather/scatter path, recycler/free-list management, and quantized older pages with a recent fp residual window
 - **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
 
 ## Current Status
@@ -23,8 +23,9 @@ BarqTrain is already a useful native acceleration layer, but it is not yet a ful
 | Cross-entropy | CUDA chunked loss shipped | lower training memory and better training throughput | more fused projection-plus-loss work |
 | Data path | Rust packing shipped | lower Python overhead and less padding waste | padding-free end-to-end training path |
 | Attention | backend selection shipped | faster attention when FlashAttention is available | deeper native attention fusion |
-| Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | quantized/offloaded cache modes |
-| KV cache implementation | Phase 2 shipped | paged allocator, page tables, gather/scatter reads, recycler/free-list management, and contiguous fallback | quantized cache pages and future compaction/offload |
+| Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | offloaded cache modes and serving-side compaction accounting |
+| KV cache implementation | Phase 2 shipped | paged allocator, page tables, gather/scatter reads, recycler/free-list management, and contiguous fallback | future compaction/offload |
+| Quantized KV cache | Phase 3 shipped | older pages stored in int8 with a recent fp residual window plus quality/memory tradeoff reporting | compaction/offload and deeper attention fusion |
 | Optimizer memory | wrapper-level | optional training-memory savings | native optimizer-state control |
 
 ## Research-Backed Roadmap
@@ -249,13 +250,14 @@ BARQTRAIN_CUDA_ARCH_LIST=7.5 BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . -
 
 BarqTrain exposes thin helpers for the optimized training path:
 
-- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through chunked loss, and wraps compatible CUDA generation calls to inject BarqTrain's native KV cache automatically (`paged`, `contiguous`, or `auto`)
+- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through chunked loss, and wraps compatible CUDA generation calls to inject BarqTrain's native KV cache automatically (`paged`, `contiguous`, `paged_quantized`, or `auto`)
 - `patch_inference(model)`: inference-only patching path for decode benchmarks and low-memory generation experiments
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
-- `create_kv_cache(...)`: explicitly create a paged or contiguous KV cache
+- `create_kv_cache(...)`: explicitly create a contiguous, paged, or paged-quantized KV cache
 - `create_contiguous_kv_cache(...)`: explicitly create the contiguous fallback cache
 - `create_paged_kv_cache(...)`: explicitly create a paged KV cache when you want to control decode capacity yourself
+- `create_quantized_paged_kv_cache(...)`: explicitly create a paged KV cache that quantizes older pages and keeps a recent fp residual window
 
 ```python
 from datasets import load_dataset
@@ -298,7 +300,7 @@ optimizer = create_optimizer(
 
 ### Inference Helpers
 
-For explicit decode-cache control, you can create and pass either cache layout yourself:
+For explicit decode-cache control, you can create and pass any shipped cache layout yourself:
 
 ```python
 import torch
@@ -312,11 +314,11 @@ model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16
 patch_inference(model)
 
 inputs = tokenizer("Explain paged KV caches.", return_tensors="pt").to("cuda")
-cache = create_kv_cache(model, max_batch_size=1, max_cache_len=256, page_size=16, mode="paged")
+cache = create_kv_cache(model, max_batch_size=1, max_cache_len=256, page_size=16, mode="paged_quantized")
 outputs = model.generate(**inputs, max_new_tokens=64, past_key_values=cache)
 ```
 
-Runtime selection is also available via `BARQTRAIN_KV_CACHE_MODE=auto|paged|contiguous`. Detailed native memory bucket collection remains gated behind `BARQTRAIN_DETAILED_PROFILING=1` so release-path overhead stays minimal.
+Runtime selection is also available via `BARQTRAIN_KV_CACHE_MODE=auto|paged|contiguous|paged_quantized`. The quantized path uses `BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS` to keep a recent fp16/bf16 window while older pages are stored in int8. Detailed native memory bucket collection remains gated behind `BARQTRAIN_DETAILED_PROFILING=1` so release-path overhead stays minimal.
 
 
 ```python
@@ -353,7 +355,7 @@ trainer.train()
 BarqTrain should be evaluated in two separate ways:
 
 - **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
-- **Inference path**: Phase 1 reports memory buckets separately, and Phase 2 compares paged versus contiguous KV-cache behavior instead of collapsing everything into one VRAM number.
+- **Inference path**: Phase 1 reports memory buckets separately, Phase 2 compares paged versus contiguous KV-cache behavior, and Phase 3 extends that to quantized older pages with explicit quality/memory tradeoffs.
 
 Shipped benchmark reporting now includes these memory buckets explicitly:
 
@@ -390,14 +392,30 @@ Each Phase 2 KV report entry records:
 6. `peak_vram_mb`
 7. the same bucketed `memory` breakdown used by Phase 1
 
+The shipped Phase 3 quantized KV benchmark suite compares `contiguous`, `paged`, and `paged_quantized` layouts on:
+
+1. `memory_savings_vs_latency`
+2. `long_context_generation_quality`
+3. `throughput_per_gb`
+
+Each Phase 3 quantized KV report entry records:
+
+1. `throughput_per_gb`
+2. `memory_savings_vs_contiguous_percent`
+3. `latency_vs_contiguous_percent`
+4. `generation_match_ratio`
+5. `perplexity`
+6. `reference_perplexity`
+7. the same resident, peak, and bucketed memory fields used by earlier suites
+
 The remaining roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
-1. quantized KV-cache
-2. fused projection-plus-loss improvements
-3. padding-free packed training
-4. activation-memory control
-5. native optimizer-state control
-6. deeper block fusion and decode-heavy attention fusion
+1. fused projection-plus-loss improvements
+2. padding-free packed training
+3. activation-memory control
+4. native optimizer-state control
+5. deeper block fusion and decode-heavy attention fusion
+6. future cache compaction/offload
 
 Example Phase 1 report shape:
 
@@ -444,6 +462,33 @@ Example Phase 2 report shape:
       "fragmentation_ratio": 0.0,
       "resident_vram_mb": 0.0,
       "peak_vram_mb": 0.0,
+      "memory": {
+        "resident_model_mb": 0.0,
+        "kv_cache_mb": 0.0,
+        "temporary_decode_buffers_mb": 0.0,
+        "training_peak_vram_mb": 0.0,
+        "inference_peak_vram_mb": 0.0
+      }
+    }
+  ]
+}
+```
+
+Example Phase 3 report shape:
+
+```json
+{
+  "benchmark_suite": "phase3",
+  "quantized_kv_profiles": [
+    {
+      "scenario_name": "memory_savings_vs_latency",
+      "cache_layout": "paged_quantized",
+      "throughput_per_gb": 0.0,
+      "memory_savings_vs_contiguous_percent": 0.0,
+      "latency_vs_contiguous_percent": 0.0,
+      "generation_match_ratio": 1.0,
+      "perplexity": 0.0,
+      "reference_perplexity": 0.0,
       "memory": {
         "resident_model_mb": 0.0,
         "kv_cache_mb": 0.0,
