@@ -1,5 +1,6 @@
 """Tests for BarqTrain paged KV-cache helpers."""
 
+import os
 import types
 
 import torch
@@ -319,3 +320,59 @@ def test_patch_generate_can_use_contiguous_kv_mode(monkeypatch):
     assert model._barqtrain_last_generate_used_paged_kv is False
     assert model._barqtrain_last_generate_used_contiguous_kv is True
     assert model._barqtrain_last_generate_kv_cache_layout == "contiguous"
+
+
+def test_patch_generate_preserves_generation_parity_across_kv_layouts(monkeypatch):
+    import barqtrain.patch_models as patch_models
+
+    class ToyDecodeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+            )
+
+        def forward(self, input_ids=None, logits_to_keep=None, past_key_values=None):
+            del past_key_values
+            batch_size, seq_len = input_ids.shape
+            vocab_size = 16
+            decode_width = 1 if logits_to_keep == 1 else seq_len
+            logits = torch.zeros(batch_size, decode_width, vocab_size, dtype=torch.float32)
+            next_token = (input_ids[:, -1] + 1) % vocab_size
+            logits[:, -1, :] = -1e9
+            logits[torch.arange(batch_size), decode_width - 1, next_token] = 1.0
+            return types.SimpleNamespace(logits=logits)
+
+        def generate(self, input_ids=None, max_new_tokens=4, logits_to_keep=None, past_key_values=None, **kwargs):
+            del past_key_values, kwargs
+            tokens = input_ids.clone()
+            for _ in range(max_new_tokens):
+                outputs = self.forward(input_ids=tokens, logits_to_keep=logits_to_keep)
+                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                tokens = torch.cat([tokens, next_token], dim=-1)
+            return tokens
+
+    def fake_prepare(model, args, kwargs):
+        del model, args
+        layout = os.environ.get("BARQTRAIN_KV_CACHE_MODE", "paged")
+        cache = types.SimpleNamespace(barqtrain_cache_layout=layout)
+        return ({**kwargs, "past_key_values": cache}, True)
+
+    monkeypatch.setattr("barqtrain.kv_cache.maybe_prepare_kv_generate_kwargs", fake_prepare)
+    monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: True)
+
+    model = patch_models._patch_generate_with_paged_kv(ToyDecodeModel(), "Toy")
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    monkeypatch.setenv("BARQTRAIN_KV_CACHE_MODE", "paged")
+    paged = model.generate(input_ids=input_ids, max_new_tokens=5)
+    assert model._barqtrain_last_generate_used_paged_kv is True
+    assert model._barqtrain_last_generate_kv_cache_layout == "paged"
+
+    monkeypatch.setenv("BARQTRAIN_KV_CACHE_MODE", "contiguous")
+    contiguous = model.generate(input_ids=input_ids, max_new_tokens=5)
+    assert model._barqtrain_last_generate_used_contiguous_kv is True
+    assert model._barqtrain_last_generate_kv_cache_layout == "contiguous"
+
+    assert torch.equal(paged, contiguous)
