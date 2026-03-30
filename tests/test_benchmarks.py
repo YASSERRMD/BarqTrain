@@ -1,5 +1,6 @@
-"""Tests for the Phase 1 benchmark harness."""
+"""Tests for the benchmark harness."""
 
+import os
 from types import SimpleNamespace
 
 import torch
@@ -84,9 +85,24 @@ class FakeModel(torch.nn.Module):
 
     def generate(self, input_ids=None, max_new_tokens=1, logits_to_keep=None, **kwargs):
         del kwargs
-        self._barqtrain_last_generate_used_paged_kv = False
+        cache_layout = os.environ.get("BARQTRAIN_KV_CACHE_MODE", "contiguous")
+        self._barqtrain_last_generate_used_paged_kv = cache_layout == "paged"
+        self._barqtrain_last_generate_used_contiguous_kv = cache_layout == "contiguous"
+        self._barqtrain_last_generate_kv_cache_layout = cache_layout
         self._barqtrain_last_generate_last_token_logits_only = logits_to_keep == 1
-        self._barqtrain_last_generate_cache = None
+        resident_model_bytes = 64 * 1024 * 1024
+        kv_cache_bytes = (16 if cache_layout == "paged" else 24) * 1024 * 1024
+        decode_temp_bytes = (8 if cache_layout == "paged" else 12) * 1024 * 1024
+        self._barqtrain_last_generate_resident_model_bytes = resident_model_bytes
+        self._barqtrain_last_generate_kv_cache_bytes = kv_cache_bytes
+        self._barqtrain_last_generate_decode_temp_bytes = decode_temp_bytes
+        self._barqtrain_last_generate_inference_peak_bytes = (
+            resident_model_bytes + kv_cache_bytes + decode_temp_bytes
+        )
+        self._barqtrain_last_generate_cache = SimpleNamespace(
+            barqtrain_cache_layout=cache_layout,
+            fragmentation_ratio=lambda: 0.25 if cache_layout == "paged" else 0.0,
+        )
         append = torch.full(
             (input_ids.size(0), max_new_tokens),
             7,
@@ -164,3 +180,46 @@ def test_phase1_benchmark_report_serializes_separate_memory_buckets(monkeypatch,
     assert "temporary_decode_buffers_mb" in payload
     assert "training_peak_vram_mb" in payload
     assert "inference_peak_vram_mb" in payload
+
+
+def test_phase2_kv_benchmark_report_serializes_layout_comparison(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+    )
+
+    report = harness.run_phase2_benchmarks(
+        cache_layouts=("contiguous", "paged"),
+        serving_request_count=3,
+        fixed_vram_budget_mb=256.0,
+    )
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase2"
+    assert len(report.kv_cache_profiles) == 12
+    assert {profile.scenario_name for profile in report.kv_cache_profiles} == {
+        "long_prompt_generation",
+        "multi_request_serving",
+        "fixed_vram_batch_growth",
+    }
+    assert {profile.cache_layout for profile in report.kv_cache_profiles} == {"contiguous", "paged"}
+    assert all(profile.oom_rate == 0.0 for profile in report.kv_cache_profiles)
+    assert all(profile.peak_vram_mb >= profile.resident_vram_mb for profile in report.kv_cache_profiles)
+    assert any(profile.fragmentation_ratio > 0.0 for profile in report.kv_cache_profiles if profile.cache_layout == "paged")
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase2_results.json"
+    assert "scenario_name" in payload
+    assert "cache_layout" in payload
+    assert "oom_rate" in payload
+    assert "fragmentation_ratio" in payload
+    assert "resident_vram_mb" in payload
+    assert "peak_vram_mb" in payload

@@ -7,6 +7,7 @@ from barqtrain.benchmarks.baseline import (
     BenchmarkMetrics,
     BenchmarkReport,
     InferenceBenchmarkMetrics,
+    KVCacheBenchmarkMetrics,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "BenchmarkMetrics",
     "BenchmarkReport",
     "InferenceBenchmarkMetrics",
+    "KVCacheBenchmarkMetrics",
 ]

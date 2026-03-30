@@ -76,6 +76,16 @@ class DecodeBenchmarkProfile:
     batch_size: int
 
 
+@dataclass(frozen=True)
+class KVCacheBenchmarkProfile:
+    name: str
+    prompt_length: int
+    decode_length: int
+    batch_size: int
+    request_count: int = 1
+    fixed_vram_budget_mb: int = 0
+
+
 def generation_overhead_mb(
     resident_snapshot: CudaMemorySnapshot,
     peak_snapshot: CudaMemorySnapshot,
@@ -376,6 +386,73 @@ def phase1_inference_profiles(
     return profiles
 
 
+def phase2_kv_cache_profiles(
+    batch_sizes: Sequence[int] = (1, 4, 8),
+    *,
+    short_prompt_length: int = 64,
+    long_prompt_length: int = 1024,
+    short_decode_length: int = 32,
+    long_decode_length: int = 256,
+    serving_request_count: int = 8,
+    fixed_vram_budget_mb: int = 2048,
+) -> list[KVCacheBenchmarkProfile]:
+    """
+    Return the required Phase 2 contiguous-vs-paged KV benchmark matrix.
+    """
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "phase2_kv_cache_profiles"):
+        native_profiles = rust_backend.phase2_kv_cache_profiles(
+            list(batch_sizes),
+            int(short_prompt_length),
+            int(long_prompt_length),
+            int(short_decode_length),
+            int(long_decode_length),
+            int(serving_request_count),
+            int(fixed_vram_budget_mb),
+        )
+        return [
+            KVCacheBenchmarkProfile(
+                name=str(profile.name),
+                prompt_length=int(profile.prompt_length),
+                decode_length=int(profile.decode_length),
+                batch_size=int(profile.batch_size),
+                request_count=int(profile.request_count),
+                fixed_vram_budget_mb=int(profile.fixed_vram_budget_mb),
+            )
+            for profile in native_profiles
+        ]
+
+    profiles: list[KVCacheBenchmarkProfile] = []
+    for batch_size in batch_sizes:
+        profiles.append(
+            KVCacheBenchmarkProfile(
+                name="long_prompt_generation",
+                prompt_length=long_prompt_length,
+                decode_length=long_decode_length,
+                batch_size=int(batch_size),
+            )
+        )
+        profiles.append(
+            KVCacheBenchmarkProfile(
+                name="multi_request_serving",
+                prompt_length=short_prompt_length,
+                decode_length=long_decode_length,
+                batch_size=int(batch_size),
+                request_count=int(max(serving_request_count, 1)),
+            )
+        )
+        profiles.append(
+            KVCacheBenchmarkProfile(
+                name="fixed_vram_batch_growth",
+                prompt_length=long_prompt_length,
+                decode_length=short_decode_length,
+                batch_size=int(batch_size),
+                fixed_vram_budget_mb=int(fixed_vram_budget_mb),
+            )
+        )
+    return profiles
+
+
 def _model_forward_parameter_name(
     model: torch.nn.Module,
     candidates: tuple[str, ...],
@@ -484,6 +561,7 @@ __all__ = [
     "BenchmarkMemoryBreakdown",
     "CudaMemorySnapshot",
     "DecodeBenchmarkProfile",
+    "KVCacheBenchmarkProfile",
     "build_generation_kwargs",
     "build_memory_breakdown",
     "capture_cuda_peak_bytes",
@@ -496,6 +574,7 @@ __all__ = [
     "native_memory_snapshot",
     "paged_kv_cache_bytes",
     "phase1_inference_profiles",
+    "phase2_kv_cache_profiles",
     "preferred_last_token_logits_kwarg",
     "record_inference_peak_bytes",
     "record_training_peak_bytes",
