@@ -48,9 +48,11 @@ from barqtrain.memory import (
 from barqtrain.kv_cache import (
     BarqContiguousKVCache,
     BarqPagedKVCache,
+    BarqQuantizedPagedKVCache,
     create_contiguous_kv_cache,
     create_kv_cache,
     create_paged_kv_cache,
+    create_quantized_paged_kv_cache,
 )
 from barqtrain.optim import create_optimizer
 
@@ -76,9 +78,11 @@ __all__ = [
     "build_generation_kwargs",
     "BarqContiguousKVCache",
     "BarqPagedKVCache",
+    "BarqQuantizedPagedKVCache",
     "create_contiguous_kv_cache",
     "create_kv_cache",
     "create_paged_kv_cache",
+    "create_quantized_paged_kv_cache",
     "create_optimizer",
     "__version__",
 ]

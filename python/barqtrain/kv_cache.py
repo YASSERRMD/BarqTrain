@@ -36,7 +36,9 @@ def _min_paged_kv_cache_len() -> int:
 
 def _kv_cache_mode(default: str = "auto") -> str:
     mode = os.environ.get("BARQTRAIN_KV_CACHE_MODE", default).strip().lower()
-    if mode not in {"auto", "paged", "contiguous"}:
+    if mode == "quantized":
+        mode = "paged_quantized"
+    if mode not in {"auto", "paged", "contiguous", "paged_quantized"}:
         raise ValueError(f"Unsupported BARQTRAIN_KV_CACHE_MODE={mode!r}")
     return mode
 
@@ -1034,6 +1036,7 @@ def create_kv_cache(
     mode: str = "paged",
 ):
     """Create a paged or contiguous KV cache."""
+    mode = "paged_quantized" if mode == "quantized" else mode
     if mode == "paged":
         return create_paged_kv_cache(
             model_or_config,
@@ -1041,6 +1044,20 @@ def create_kv_cache(
             max_cache_len=max_cache_len,
             page_size=page_size,
             total_blocks=total_blocks,
+        )
+    if mode == "paged_quantized":
+        return create_quantized_paged_kv_cache(
+            model_or_config,
+            max_batch_size=max_batch_size,
+            max_cache_len=max_cache_len,
+            page_size=page_size,
+            total_blocks=total_blocks,
+            residual_window_tokens=int(
+                os.environ.get(
+                    "BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS",
+                    str(_quantized_residual_window_tokens()),
+                )
+            ),
         )
     if mode == "contiguous":
         return create_contiguous_kv_cache(
