@@ -9,8 +9,11 @@ from barqtrain.kv_cache import (
     BarqContiguousKVCache,
     BarqPagedKVCache,
     BarqPagedKVCacheLayer,
+    BarqQuantizedPagedKVCache,
+    BarqQuantizedPagedKVCacheLayer,
     create_contiguous_kv_cache,
     create_kv_cache,
+    create_quantized_paged_kv_cache,
     maybe_prepare_kv_generate_kwargs,
     create_paged_kv_cache,
     maybe_prepare_paged_kv_generate_kwargs,
@@ -80,12 +83,64 @@ def test_create_contiguous_kv_cache_uses_decoder_layer_count():
     assert cache.barqtrain_max_cache_len == 64
 
 
+def test_create_quantized_paged_kv_cache_uses_decoder_layer_count():
+    cache = create_quantized_paged_kv_cache(
+        DummyConfig(),
+        max_batch_size=2,
+        max_cache_len=64,
+        page_size=16,
+        residual_window_tokens=16,
+    )
+
+    assert isinstance(cache, BarqQuantizedPagedKVCache)
+    assert len(cache.layers) == 3
+    assert cache.barqtrain_max_batch_size == 2
+    assert cache.barqtrain_max_cache_len == 64
+    assert cache.barqtrain_residual_window_tokens == 16
+    assert cache.barqtrain_cache_layout == "paged_quantized"
+
+
 def test_create_kv_cache_respects_mode():
     paged = create_kv_cache(DummyConfig(), max_batch_size=1, max_cache_len=32, mode="paged")
     contiguous = create_kv_cache(DummyConfig(), max_batch_size=1, max_cache_len=32, mode="contiguous")
 
     assert isinstance(paged, BarqPagedKVCache)
     assert isinstance(contiguous, BarqContiguousKVCache)
+
+
+def test_quantized_paged_kv_layer_quantizes_older_blocks():
+    layer = BarqQuantizedPagedKVCacheLayer(
+        max_batch_size=1,
+        max_cache_len=8,
+        page_size=2,
+        total_blocks=4,
+        residual_window_tokens=2,
+    )
+
+    first_keys = torch.tensor(
+        [[[[0.25, -0.50], [0.75, -1.00]]]],
+        dtype=torch.float32,
+    )
+    first_values = first_keys + 0.125
+    second_keys = torch.tensor(
+        [[[[0.50, -0.25], [0.90, -0.60]]]],
+        dtype=torch.float32,
+    )
+    second_values = second_keys - 0.125
+
+    layer.update(first_keys, first_values)
+    assert layer.quantized_blocks() == 0
+    assert int(layer.residual_page_table[0, 0].item()) >= 0
+
+    keys, values = layer.update(second_keys, second_values)
+
+    assert layer.quantized_blocks() == 1
+    assert int(layer.residual_page_table[0, 0].item()) == -1
+    assert int(layer.residual_page_table[0, 1].item()) >= 0
+    assert torch.allclose(keys[:, :, :2, :], first_keys, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(values[:, :, :2, :], first_values, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(keys[:, :, 2:, :], second_keys, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(values[:, :, 2:, :], second_values, atol=1e-5, rtol=1e-5)
 
 
 def test_maybe_prepare_paged_kv_generate_kwargs_injects_cache(monkeypatch):

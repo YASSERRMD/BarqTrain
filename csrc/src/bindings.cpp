@@ -111,6 +111,15 @@ torch::Tensor paged_kv_gather_cuda(
     torch::Tensor seq_lens
 );
 
+torch::Tensor paged_kv_gather_quantized_cuda(
+    torch::Tensor quantized_cache,
+    torch::Tensor residual_cache,
+    torch::Tensor scales,
+    torch::Tensor page_table,
+    torch::Tensor residual_page_table,
+    torch::Tensor seq_lens
+);
+
 void barqtrain_memory_set_enabled(bool enabled) {
     auto& state = memory_tracker_state();
     std::lock_guard<std::mutex> lock(memory_tracker_mutex());
@@ -205,6 +214,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Append key/value states into the paged KV cache (CUDA)");
     m.def("paged_kv_gather", &paged_kv_gather_cuda,
           "Gather logical KV sequences from the paged KV cache (CUDA)");
+    m.def("paged_kv_gather_quantized", &paged_kv_gather_quantized_cuda,
+          "Gather logical KV sequences from a quantized paged KV cache (CUDA)");
 
     // Native memory accounting hooks
     m.def("barqtrain_memory_set_enabled", &barqtrain_memory_set_enabled,

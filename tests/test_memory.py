@@ -214,6 +214,56 @@ def test_paged_kv_cache_bytes_sums_unique_layer_allocations(monkeypatch):
     assert paged_kv_cache_bytes(cache) == 960
 
 
+def test_paged_kv_cache_bytes_counts_quantized_cache_tensors(monkeypatch):
+    sentinel_ptrs = {}
+
+    def fake_storage_bytes(tensor):
+        return sentinel_ptrs[id(tensor)]
+
+    monkeypatch.setattr("barqtrain.memory._storage_bytes_for_cuda_tensor", fake_storage_bytes)
+
+    quantized_keys = object()
+    quantized_values = object()
+    residual_keys = object()
+    residual_values = object()
+    key_scales = object()
+    value_scales = object()
+    page_table = object()
+    residual_page_table = object()
+    seq_lens = object()
+    slot_map = object()
+
+    sentinel_ptrs[id(quantized_keys)] = (11, 128)
+    sentinel_ptrs[id(quantized_values)] = (12, 128)
+    sentinel_ptrs[id(residual_keys)] = (13, 256)
+    sentinel_ptrs[id(residual_values)] = (14, 256)
+    sentinel_ptrs[id(key_scales)] = (15, 64)
+    sentinel_ptrs[id(value_scales)] = (16, 64)
+    sentinel_ptrs[id(page_table)] = (17, 32)
+    sentinel_ptrs[id(residual_page_table)] = (18, 32)
+    sentinel_ptrs[id(seq_lens)] = (19, 16)
+    sentinel_ptrs[id(slot_map)] = (20, 16)
+
+    cache = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                quantized_keys=quantized_keys,
+                quantized_values=quantized_values,
+                residual_keys=residual_keys,
+                residual_values=residual_values,
+                key_scales=key_scales,
+                value_scales=value_scales,
+                page_table=page_table,
+                residual_page_table=residual_page_table,
+                seq_lens=seq_lens,
+                physical_block_to_residual_slot=slot_map,
+            )
+        ]
+    )
+
+    assert paged_kv_cache_bytes(cache) == 992
+
+
 def test_track_decode_temp_memory_records_remainder(monkeypatch):
     recorded = {}
 

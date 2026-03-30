@@ -224,7 +224,20 @@ def paged_kv_cache_bytes(cache) -> int:
     total_bytes = 0
     seen_storages: set[int] = set()
     for layer in getattr(cache, "layers", []):
-        for tensor_name in ("keys", "values", "seq_lens"):
+        for tensor_name in (
+            "keys",
+            "values",
+            "quantized_keys",
+            "quantized_values",
+            "residual_keys",
+            "residual_values",
+            "key_scales",
+            "value_scales",
+            "seq_lens",
+            "page_table",
+            "residual_page_table",
+            "physical_block_to_residual_slot",
+        ):
             tensor = getattr(layer, tensor_name, None)
             if tensor is None:
                 continue
