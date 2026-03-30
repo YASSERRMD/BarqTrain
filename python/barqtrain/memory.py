@@ -441,6 +441,45 @@ def build_generation_kwargs(
     return kwargs
 
 
+def last_token_logits_only_enabled() -> bool:
+    """
+    Return whether decode-time last-token logits specialization is enabled.
+    """
+    return _env_enabled("BARQTRAIN_LAST_TOKEN_LOGITS_ONLY", "1")
+
+
+def maybe_prepare_last_token_logits_generate_kwargs(
+    model: torch.nn.Module,
+    args,
+    kwargs: dict,
+) -> tuple[dict, bool]:
+    """
+    Request last-token logits only for generate() when the model supports it.
+    """
+    del args  # The specialization only depends on model support and generate kwargs.
+
+    if not last_token_logits_only_enabled():
+        return kwargs, False
+
+    kwarg_name = preferred_last_token_logits_kwarg(model)
+    if kwarg_name is None:
+        return kwargs, False
+
+    if kwargs.get("output_logits"):
+        return kwargs, False
+
+    generation_config = kwargs.get("generation_config") or getattr(model, "generation_config", None)
+    if generation_config is not None and getattr(generation_config, "output_logits", False):
+        return kwargs, False
+
+    if kwarg_name in kwargs:
+        return kwargs, int(kwargs[kwarg_name]) == 1
+
+    updated_kwargs = dict(kwargs)
+    updated_kwargs[kwarg_name] = 1
+    return updated_kwargs, True
+
+
 __all__ = [
     "BenchmarkMemoryBreakdown",
     "CudaMemorySnapshot",
@@ -451,6 +490,8 @@ __all__ = [
     "cuda_memory_snapshot",
     "detailed_profiling_enabled",
     "generation_overhead_mb",
+    "last_token_logits_only_enabled",
+    "maybe_prepare_last_token_logits_generate_kwargs",
     "model_resident_cuda_bytes",
     "native_memory_snapshot",
     "paged_kv_cache_bytes",

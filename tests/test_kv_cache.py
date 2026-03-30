@@ -128,3 +128,80 @@ def test_patch_generate_with_paged_kv_records_usage(monkeypatch):
     assert result["sentinel"] is True
     assert model._barqtrain_last_generate_used_paged_kv is True
     assert model._barqtrain_paged_kv_supported is True
+
+
+def test_patch_generate_records_last_token_logits_specialization(monkeypatch):
+    import barqtrain.patch_models as patch_models
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = DummyConfig()
+
+        def forward(self, input_ids=None, logits_to_keep=None):
+            return logits_to_keep
+
+        def generate(self, *args, **kwargs):
+            return kwargs
+
+    monkeypatch.setattr(
+        "barqtrain.kv_cache.maybe_prepare_paged_kv_generate_kwargs",
+        lambda model, args, kwargs: (kwargs, False),
+    )
+    monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: False)
+    monkeypatch.setattr(
+        "barqtrain.memory.maybe_prepare_last_token_logits_generate_kwargs",
+        lambda model, args, kwargs: ({**kwargs, "logits_to_keep": 1}, True),
+    )
+
+    model = patch_models._patch_generate_with_paged_kv(DummyModel(), "Dummy")
+    result = model.generate(input_ids=torch.tensor([[1, 2, 3]]))
+
+    assert result["logits_to_keep"] == 1
+    assert model._barqtrain_last_generate_last_token_logits_only is True
+
+
+def test_patch_generate_preserves_generation_parity_with_last_token_logits_only(monkeypatch):
+    import barqtrain.patch_models as patch_models
+
+    class ToyDecodeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+            )
+
+        def forward(self, input_ids=None, logits_to_keep=None):
+            batch_size, seq_len = input_ids.shape
+            vocab_size = 16
+            decode_width = 1 if logits_to_keep == 1 else seq_len
+            logits = torch.zeros(batch_size, decode_width, vocab_size, dtype=torch.float32)
+            next_token = (input_ids[:, -1] + 1) % vocab_size
+            logits[:, -1, :] = -1e9
+            logits[torch.arange(batch_size), decode_width - 1, next_token] = 1.0
+            return types.SimpleNamespace(logits=logits)
+
+        def generate(self, input_ids=None, max_new_tokens=4, logits_to_keep=None, **kwargs):
+            tokens = input_ids.clone()
+            for _ in range(max_new_tokens):
+                outputs = self.forward(input_ids=tokens, logits_to_keep=logits_to_keep)
+                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                tokens = torch.cat([tokens, next_token], dim=-1)
+            return tokens
+
+    monkeypatch.setattr(
+        "barqtrain.kv_cache.maybe_prepare_paged_kv_generate_kwargs",
+        lambda model, args, kwargs: (kwargs, False),
+    )
+    monkeypatch.setattr("barqtrain.kv_cache.paged_kv_supported_for_model", lambda model: False)
+
+    baseline_model = ToyDecodeModel()
+    patched_model = patch_models._patch_generate_with_paged_kv(ToyDecodeModel(), "Toy")
+
+    input_ids = torch.tensor([[1, 2, 3]])
+    baseline = baseline_model.generate(input_ids=input_ids, max_new_tokens=5)
+    patched = patched_model.generate(input_ids=input_ids, max_new_tokens=5)
+
+    assert torch.equal(patched, baseline)
+    assert patched_model._barqtrain_last_generate_last_token_logits_only is True

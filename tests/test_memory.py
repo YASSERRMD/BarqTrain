@@ -13,6 +13,7 @@ from barqtrain.memory import (
     cuda_memory_snapshot,
     detailed_profiling_enabled,
     generation_overhead_mb,
+    maybe_prepare_last_token_logits_generate_kwargs,
     native_memory_snapshot,
     paged_kv_cache_bytes,
     phase1_inference_profiles,
@@ -249,3 +250,37 @@ def test_native_memory_snapshot_falls_back_without_backend(monkeypatch):
 
     assert snapshot["enabled"] is False
     assert snapshot["resident_model_current_bytes"] == 0
+
+
+def test_maybe_prepare_last_token_logits_generate_kwargs_sets_supported_kwarg(monkeypatch):
+    monkeypatch.setenv("BARQTRAIN_LAST_TOKEN_LOGITS_ONLY", "1")
+
+    class DummyModel(torch.nn.Module):
+        def forward(self, input_ids=None, logits_to_keep=None):
+            return input_ids, logits_to_keep
+
+    updated_kwargs, enabled = maybe_prepare_last_token_logits_generate_kwargs(
+        DummyModel(),
+        (),
+        {"max_new_tokens": 8},
+    )
+
+    assert enabled is True
+    assert updated_kwargs["logits_to_keep"] == 1
+
+
+def test_maybe_prepare_last_token_logits_generate_kwargs_respects_output_logits(monkeypatch):
+    monkeypatch.setenv("BARQTRAIN_LAST_TOKEN_LOGITS_ONLY", "1")
+
+    class DummyModel(torch.nn.Module):
+        def forward(self, input_ids=None, logits_to_keep=None):
+            return input_ids, logits_to_keep
+
+    updated_kwargs, enabled = maybe_prepare_last_token_logits_generate_kwargs(
+        DummyModel(),
+        (),
+        {"max_new_tokens": 8, "output_logits": True},
+    )
+
+    assert enabled is False
+    assert "logits_to_keep" not in updated_kwargs
