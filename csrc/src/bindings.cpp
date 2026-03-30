@@ -99,9 +99,16 @@ torch::Tensor fused_lora_forward_cuda(
 void paged_kv_append_cuda(
     torch::Tensor key_cache,
     torch::Tensor value_cache,
+    torch::Tensor page_table,
     torch::Tensor seq_lens,
     torch::Tensor key_states,
     torch::Tensor value_states
+);
+
+torch::Tensor paged_kv_gather_cuda(
+    torch::Tensor cache,
+    torch::Tensor page_table,
+    torch::Tensor seq_lens
 );
 
 void barqtrain_memory_set_enabled(bool enabled) {
@@ -196,6 +203,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // KV-cache functions
     m.def("paged_kv_append_", &paged_kv_append_cuda,
           "Append key/value states into the paged KV cache (CUDA)");
+    m.def("paged_kv_gather", &paged_kv_gather_cuda,
+          "Gather logical KV sequences from the paged KV cache (CUDA)");
 
     // Native memory accounting hooks
     m.def("barqtrain_memory_set_enabled", &barqtrain_memory_set_enabled,
