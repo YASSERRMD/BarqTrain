@@ -466,6 +466,67 @@ def phase2_kv_cache_profiles(
     return profiles
 
 
+def phase3_quantized_kv_profiles(
+    batch_sizes: Sequence[int] = (1, 4, 8),
+    *,
+    short_prompt_length: int = 64,
+    long_prompt_length: int = 1024,
+    quality_decode_length: int = 64,
+    long_decode_length: int = 256,
+) -> list[KVCacheBenchmarkProfile]:
+    """
+    Return the required Phase 3 quantized KV benchmark matrix.
+    """
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "phase3_quantized_kv_profiles"):
+        native_profiles = rust_backend.phase3_quantized_kv_profiles(
+            list(batch_sizes),
+            int(short_prompt_length),
+            int(long_prompt_length),
+            int(quality_decode_length),
+            int(long_decode_length),
+        )
+        return [
+            KVCacheBenchmarkProfile(
+                name=str(profile.name),
+                prompt_length=int(profile.prompt_length),
+                decode_length=int(profile.decode_length),
+                batch_size=int(profile.batch_size),
+                request_count=int(profile.request_count),
+                fixed_vram_budget_mb=int(profile.fixed_vram_budget_mb),
+            )
+            for profile in native_profiles
+        ]
+
+    profiles: list[KVCacheBenchmarkProfile] = []
+    for batch_size in batch_sizes:
+        profiles.append(
+            KVCacheBenchmarkProfile(
+                name="memory_savings_vs_latency",
+                prompt_length=long_prompt_length,
+                decode_length=long_decode_length,
+                batch_size=int(batch_size),
+            )
+        )
+        profiles.append(
+            KVCacheBenchmarkProfile(
+                name="long_context_generation_quality",
+                prompt_length=long_prompt_length,
+                decode_length=quality_decode_length,
+                batch_size=int(batch_size),
+            )
+        )
+        profiles.append(
+            KVCacheBenchmarkProfile(
+                name="throughput_per_gb",
+                prompt_length=short_prompt_length,
+                decode_length=long_decode_length,
+                batch_size=int(batch_size),
+            )
+        )
+    return profiles
+
+
 def _model_forward_parameter_name(
     model: torch.nn.Module,
     candidates: tuple[str, ...],
@@ -588,6 +649,7 @@ __all__ = [
     "paged_kv_cache_bytes",
     "phase1_inference_profiles",
     "phase2_kv_cache_profiles",
+    "phase3_quantized_kv_profiles",
     "preferred_last_token_logits_kwarg",
     "record_inference_peak_bytes",
     "record_training_peak_bytes",

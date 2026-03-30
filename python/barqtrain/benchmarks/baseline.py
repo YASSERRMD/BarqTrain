@@ -32,6 +32,7 @@ from barqtrain.memory import (
     paged_kv_cache_bytes,
     phase1_inference_profiles,
     phase2_kv_cache_profiles,
+    phase3_quantized_kv_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
 )
@@ -100,6 +101,29 @@ class KVCacheBenchmarkMetrics:
 
 
 @dataclass
+class QuantizedKVBenchmarkMetrics:
+    """Inference benchmark metrics for quantized KV-cache quality and memory tradeoffs."""
+
+    scenario_name: str
+    cache_layout: str
+    batch_size: int
+    prompt_length: int
+    decode_length: int
+    total_new_tokens: int
+    total_time_seconds: float
+    tokens_per_second: float
+    resident_vram_mb: float
+    peak_vram_mb: float
+    throughput_per_gb: float
+    memory_savings_vs_contiguous_percent: float
+    latency_vs_contiguous_percent: float
+    generation_match_ratio: float
+    perplexity: Optional[float] = None
+    reference_perplexity: Optional[float] = None
+    memory: BenchmarkMemoryBreakdown = field(default_factory=BenchmarkMemoryBreakdown)
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -110,6 +134,7 @@ class BenchmarkReport:
     training: Optional[BenchmarkMetrics] = None
     inference_profiles: list[InferenceBenchmarkMetrics] = field(default_factory=list)
     kv_cache_profiles: list[KVCacheBenchmarkMetrics] = field(default_factory=list)
+    quantized_kv_profiles: list[QuantizedKVBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -353,6 +378,32 @@ class BenchmarkHarness:
             }
         )
         return measurements
+
+    def _sequence_perplexity(self, sequences: torch.Tensor) -> Optional[float]:
+        try:
+            outputs = self.model(
+                input_ids=sequences,
+                attention_mask=torch.ones_like(sequences),
+                labels=sequences,
+            )
+        except Exception:
+            return None
+
+        loss = getattr(outputs, "loss", None)
+        if loss is None:
+            return None
+        loss_value = float(loss.detach().float().item())
+        return float(math.exp(min(loss_value, 20.0)))
+
+    @staticmethod
+    def _generation_match_ratio(reference: torch.Tensor, candidate: torch.Tensor, prompt_length: int) -> float:
+        if reference.shape != candidate.shape:
+            return 0.0
+        reference_tokens = reference[:, prompt_length:]
+        candidate_tokens = candidate[:, prompt_length:]
+        if reference_tokens.numel() == 0:
+            return 1.0
+        return float(reference_tokens.eq(candidate_tokens).float().mean().item())
 
     def run_benchmark(self) -> BenchmarkMetrics:
         """Run the training benchmark."""
@@ -670,13 +721,157 @@ class BenchmarkHarness:
             ),
         )
 
+    def run_phase3_quantized_kv_benchmarks(
+        self,
+        *,
+        cache_layouts: Sequence[str] = ("contiguous", "paged", "paged_quantized"),
+        quantized_residual_window_tokens: int = 128,
+    ) -> list[QuantizedKVBenchmarkMetrics]:
+        """Run the Phase 3 quantized KV benchmark and quality matrix."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 3 Quantized KV Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Cache Layouts: {', '.join(cache_layouts)}")
+        print(f"Batch Sizes: {', '.join(str(size) for size in self.inference_batch_sizes)}")
+        print(f"Residual Window Tokens: {quantized_residual_window_tokens}")
+        print(f"Detailed Profiling: {self.detailed_profiling}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        set_detailed_profiling_enabled(self.detailed_profiling)
+        self.setup_model_and_tokenizer()
+        self.model.eval()
+        self._ensure_inference_patch()
+
+        profiles = phase3_quantized_kv_profiles(
+            self.inference_batch_sizes,
+            short_prompt_length=self.short_prompt_length,
+            long_prompt_length=self.long_prompt_length,
+            quality_decode_length=self.short_decode_length,
+            long_decode_length=self.long_decode_length,
+        )
+
+        ordered_layouts = list(dict.fromkeys(("contiguous", *cache_layouts)))
+        baselines: dict[tuple[str, int, int, int], dict[str, object]] = {}
+        metrics: list[QuantizedKVBenchmarkMetrics] = []
+
+        with torch.inference_mode():
+            for cache_layout in ordered_layouts:
+                for profile in profiles:
+                    with _temporary_env("BARQTRAIN_KV_CACHE_MODE", cache_layout):
+                        with _temporary_env(
+                            "BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS",
+                            str(int(quantized_residual_window_tokens)),
+                        ):
+                            run = self._run_generate_call(
+                                prompt_length=profile.prompt_length,
+                                batch_size=profile.batch_size,
+                                decode_length=profile.decode_length,
+                            )
+
+                    memory = run["memory"]
+                    resident_vram_mb = memory.resident_model_mb + memory.kv_cache_mb
+                    key = (
+                        profile.name,
+                        profile.batch_size,
+                        profile.prompt_length,
+                        profile.decode_length,
+                    )
+                    perplexity = self._sequence_perplexity(run["outputs"])
+
+                    if cache_layout == "contiguous":
+                        baselines[key] = {
+                            **run,
+                            "resident_vram_mb": resident_vram_mb,
+                            "perplexity": perplexity,
+                        }
+
+                    baseline = baselines.get(key)
+                    if baseline is None:
+                        baseline = {
+                            **run,
+                            "resident_vram_mb": resident_vram_mb,
+                            "perplexity": perplexity,
+                        }
+
+                    baseline_time = max(float(baseline["total_time"]), 1e-9)
+                    baseline_resident_vram_mb = max(float(baseline["resident_vram_mb"]), 1e-9)
+                    generation_match_ratio = self._generation_match_ratio(
+                        baseline["outputs"],
+                        run["outputs"],
+                        profile.prompt_length,
+                    )
+                    metric = QuantizedKVBenchmarkMetrics(
+                        scenario_name=profile.name,
+                        cache_layout=str(run["cache_layout"] or cache_layout),
+                        batch_size=profile.batch_size,
+                        prompt_length=profile.prompt_length,
+                        decode_length=profile.decode_length,
+                        total_new_tokens=int(run["total_new_tokens"]),
+                        total_time_seconds=float(run["total_time"]),
+                        tokens_per_second=float(run["total_new_tokens"]) / max(float(run["total_time"]), 1e-9),
+                        resident_vram_mb=resident_vram_mb,
+                        peak_vram_mb=memory.inference_peak_vram_mb,
+                        throughput_per_gb=(
+                            (float(run["total_new_tokens"]) / max(float(run["total_time"]), 1e-9))
+                            / max(resident_vram_mb / 1024.0, 1e-9)
+                        ),
+                        memory_savings_vs_contiguous_percent=(
+                            (baseline_resident_vram_mb - resident_vram_mb) / baseline_resident_vram_mb * 100.0
+                        ),
+                        latency_vs_contiguous_percent=(
+                            (float(run["total_time"]) - baseline_time) / baseline_time * 100.0
+                        ),
+                        generation_match_ratio=generation_match_ratio,
+                        perplexity=perplexity,
+                        reference_perplexity=baseline["perplexity"],
+                        memory=memory,
+                    )
+                    metrics.append(metric)
+
+                    perplexity_label = f"{metric.perplexity:.3f}" if metric.perplexity is not None else "n/a"
+                    print(
+                        f"{metric.scenario_name} | layout={metric.cache_layout} | "
+                        f"bs={metric.batch_size} | tokens/s={metric.tokens_per_second:.1f} | "
+                        f"resident={metric.resident_vram_mb:.1f} MB | peak={metric.peak_vram_mb:.1f} MB | "
+                        f"mem_delta={metric.memory_savings_vs_contiguous_percent:.1f}% | "
+                        f"latency_delta={metric.latency_vs_contiguous_percent:.1f}% | "
+                        f"match={metric.generation_match_ratio:.3f} | ppl={perplexity_label}"
+                    )
+
+        return metrics
+
+    def run_phase3_benchmarks(
+        self,
+        *,
+        cache_layouts: Sequence[str] = ("contiguous", "paged", "paged_quantized"),
+        quantized_residual_window_tokens: int = 128,
+    ) -> BenchmarkReport:
+        """Run the requested Phase 3 quantized KV benchmark suite and return a structured report."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase3",
+            quantized_kv_profiles=self.run_phase3_quantized_kv_benchmarks(
+                cache_layouts=cache_layouts,
+                quantized_residual_window_tokens=quantized_residual_window_tokens,
+            ),
+        )
+
     def save_results(self, results: BenchmarkMetrics | BenchmarkReport) -> Path:
         """Save benchmark results to JSON."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if isinstance(results, BenchmarkMetrics):
             filename = "baseline_results.json"
         else:
-            filename = "phase2_results.json" if results.benchmark_suite == "phase2" else "phase1_results.json"
+            if results.benchmark_suite == "phase2":
+                filename = "phase2_results.json"
+            elif results.benchmark_suite == "phase3":
+                filename = "phase3_results.json"
+            else:
+                filename = "phase1_results.json"
         results_file = self.output_dir / filename
         with open(results_file, "w", encoding="utf-8") as handle:
             json.dump(asdict(results), handle, indent=2)
@@ -718,6 +913,20 @@ class BenchmarkHarness:
                     f"{best_profile.resident_vram_mb:.1f} / "
                     f"{best_profile.peak_vram_mb:.1f} MB"
                 )
+            if results.quantized_kv_profiles:
+                best_profile = max(results.quantized_kv_profiles, key=lambda metric: metric.tokens_per_second)
+                print(
+                    f"Fastest Quantized KV Scenario: {best_profile.scenario_name} "
+                    f"({best_profile.cache_layout}, bs={best_profile.batch_size}, "
+                    f"{best_profile.tokens_per_second:.1f} tokens/s)"
+                )
+                print(
+                    f"Quantized KV Delta/Match/Perplexity: "
+                    f"{best_profile.memory_savings_vs_contiguous_percent:.1f}% / "
+                    f"{best_profile.latency_vs_contiguous_percent:.1f}% / "
+                    f"{best_profile.generation_match_ratio:.3f} / "
+                    f"{best_profile.perplexity if best_profile.perplexity is not None else 'n/a'}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -734,11 +943,14 @@ def _parse_kv_cache_layouts(value: str) -> tuple[str, ...]:
     layouts = []
     for part in value.split(","):
         layout = part.strip().lower()
+        if layout == "quantized":
+            layout = "paged_quantized"
         if not layout:
             continue
-        if layout not in {"contiguous", "paged"}:
+        if layout not in {"contiguous", "paged", "paged_quantized"}:
             raise argparse.ArgumentTypeError(
-                f"unsupported KV cache layout {layout!r}; expected 'contiguous' or 'paged'"
+                "unsupported KV cache layout "
+                f"{layout!r}; expected 'contiguous', 'paged', or 'paged_quantized'"
             )
         if layout not in layouts:
             layouts.append(layout)
@@ -753,7 +965,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2"],
+        choices=["phase1", "phase2", "phase3"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -794,7 +1006,7 @@ def main() -> None:
         "--kv-cache-layouts",
         type=_parse_kv_cache_layouts,
         default=("contiguous", "paged"),
-        help="Comma-separated KV cache layouts, for example contiguous,paged",
+        help="Comma-separated KV cache layouts, for example contiguous,paged,paged_quantized",
     )
     parser.add_argument(
         "--kv-serving-requests",
@@ -807,6 +1019,12 @@ def main() -> None:
         type=float,
         default=2048.0,
         help="Resident/peak VRAM budget for the fixed-VRAM batch growth scenario",
+    )
+    parser.add_argument(
+        "--quantized-kv-residual-window-tokens",
+        type=int,
+        default=128,
+        help="Residual full-precision token window for the quantized KV-cache benchmark suite",
     )
     parser.add_argument("--detailed-profiling", action="store_true")
     parser.add_argument(
@@ -834,10 +1052,19 @@ def main() -> None:
     )
 
     if args.suite == "phase2":
+        phase2_layouts = tuple(layout for layout in args.kv_cache_layouts if layout in {"contiguous", "paged"})
         results = harness.run_phase2_benchmarks(
-            cache_layouts=args.kv_cache_layouts,
+            cache_layouts=phase2_layouts or ("contiguous", "paged"),
             serving_request_count=args.kv_serving_requests,
             fixed_vram_budget_mb=args.kv_fixed_vram_budget_mb,
+        )
+    elif args.suite == "phase3":
+        phase3_layouts = args.kv_cache_layouts
+        if "paged_quantized" not in phase3_layouts:
+            phase3_layouts = (*phase3_layouts, "paged_quantized")
+        results = harness.run_phase3_benchmarks(
+            cache_layouts=phase3_layouts,
+            quantized_residual_window_tokens=args.quantized_kv_residual_window_tokens,
         )
     elif args.mode == "training":
         results = harness.run_benchmark()

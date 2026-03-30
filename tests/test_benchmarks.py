@@ -42,7 +42,7 @@ class FakeTokenizer:
 
     @staticmethod
     def _encode(text, max_length=None):
-        tokens = list(range(1, len(str(text).split()) + 1)) or [1]
+        tokens = [((idx % 31) + 1) for idx, _ in enumerate(str(text).split())] or [1]
         if max_length is not None:
             tokens = tokens[:max_length]
         return tokens
@@ -88,11 +88,20 @@ class FakeModel(torch.nn.Module):
         cache_layout = os.environ.get("BARQTRAIN_KV_CACHE_MODE", "contiguous")
         self._barqtrain_last_generate_used_paged_kv = cache_layout == "paged"
         self._barqtrain_last_generate_used_contiguous_kv = cache_layout == "contiguous"
+        self._barqtrain_last_generate_used_quantized_kv = cache_layout == "paged_quantized"
         self._barqtrain_last_generate_kv_cache_layout = cache_layout
         self._barqtrain_last_generate_last_token_logits_only = logits_to_keep == 1
         resident_model_bytes = 64 * 1024 * 1024
-        kv_cache_bytes = (16 if cache_layout == "paged" else 24) * 1024 * 1024
-        decode_temp_bytes = (8 if cache_layout == "paged" else 12) * 1024 * 1024
+        kv_cache_bytes = {
+            "paged": 16,
+            "paged_quantized": 10,
+            "contiguous": 24,
+        }.get(cache_layout, 24) * 1024 * 1024
+        decode_temp_bytes = {
+            "paged": 8,
+            "paged_quantized": 10,
+            "contiguous": 12,
+        }.get(cache_layout, 12) * 1024 * 1024
         self._barqtrain_last_generate_resident_model_bytes = resident_model_bytes
         self._barqtrain_last_generate_kv_cache_bytes = kv_cache_bytes
         self._barqtrain_last_generate_decode_temp_bytes = decode_temp_bytes
@@ -101,7 +110,7 @@ class FakeModel(torch.nn.Module):
         )
         self._barqtrain_last_generate_cache = SimpleNamespace(
             barqtrain_cache_layout=cache_layout,
-            fragmentation_ratio=lambda: 0.25 if cache_layout == "paged" else 0.0,
+            fragmentation_ratio=lambda: 0.15 if cache_layout == "paged_quantized" else (0.25 if cache_layout == "paged" else 0.0),
         )
         append = torch.full(
             (input_ids.size(0), max_new_tokens),
@@ -223,3 +232,51 @@ def test_phase2_kv_benchmark_report_serializes_layout_comparison(monkeypatch, tm
     assert "fragmentation_ratio" in payload
     assert "resident_vram_mb" in payload
     assert "peak_vram_mb" in payload
+
+
+def test_phase3_quantized_kv_report_serializes_quality_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+    )
+
+    report = harness.run_phase3_benchmarks(
+        cache_layouts=("contiguous", "paged", "paged_quantized"),
+        quantized_residual_window_tokens=32,
+    )
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase3"
+    assert len(report.quantized_kv_profiles) == 18
+    assert {profile.scenario_name for profile in report.quantized_kv_profiles} == {
+        "memory_savings_vs_latency",
+        "long_context_generation_quality",
+        "throughput_per_gb",
+    }
+    assert {profile.cache_layout for profile in report.quantized_kv_profiles} == {
+        "contiguous",
+        "paged",
+        "paged_quantized",
+    }
+    assert all(profile.generation_match_ratio == 1.0 for profile in report.quantized_kv_profiles)
+    quantized_profiles = [
+        profile for profile in report.quantized_kv_profiles if profile.cache_layout == "paged_quantized"
+    ]
+    assert all(profile.memory_savings_vs_contiguous_percent > 0.0 for profile in quantized_profiles)
+    assert all(profile.perplexity is not None for profile in report.quantized_kv_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase3_results.json"
+    assert "throughput_per_gb" in payload
+    assert "memory_savings_vs_contiguous_percent" in payload
+    assert "latency_vs_contiguous_percent" in payload
+    assert "generation_match_ratio" in payload
+    assert "reference_perplexity" in payload
