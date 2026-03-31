@@ -38,7 +38,12 @@ from barqtrain.patch_models import (
     patch_model,
     patch_qwen,
 )
-from barqtrain.data import PackedCausalLMDataCollator, pack_for_causal_lm
+from barqtrain.data import (
+    PackedCausalLMDataCollator,
+    PaddingFreeCausalLMDataCollator,
+    pack_for_causal_lm,
+    pack_for_padding_free_causal_lm,
+)
 from barqtrain.memory import (
     CudaMemorySnapshot,
     build_generation_kwargs,
@@ -71,7 +76,9 @@ __all__ = [
     "patch_lfm2",
     "patch_qwen",
     "pack_for_causal_lm",
+    "pack_for_padding_free_causal_lm",
     "PackedCausalLMDataCollator",
+    "PaddingFreeCausalLMDataCollator",
     "CudaMemorySnapshot",
     "cuda_memory_snapshot",
     "generation_overhead_mb",
