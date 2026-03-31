@@ -17,6 +17,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, Sequence
 
 import torch
@@ -43,13 +44,16 @@ from barqtrain.memory import (
     phase6_activation_checkpoint_profiles,
     phase7_optimizer_profiles,
     phase8_rmsnorm_fusion_profiles,
+    phase9_attention_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
 )
+from barqtrain.attention import dispatch_attention, materialize_kv_for_attention
 from barqtrain.checkpointing import (
     apply_activation_checkpointing,
     reset_activation_checkpointing,
 )
+from barqtrain.kv_cache import create_kv_cache
 from barqtrain.ops import (
     chunked_cross_entropy_loss,
     fused_residual_rms_norm,
@@ -233,6 +237,23 @@ class RMSNormFusionBenchmarkMetrics:
 
 
 @dataclass
+class AttentionBenchmarkMetrics:
+    """Benchmark metrics for Phase 9 attention dispatch comparisons."""
+
+    scenario_name: str
+    attention_backend: str
+    cache_layout: str
+    batch_size: int
+    prompt_length: int
+    decode_length: int
+    prefill_tokens_per_second: float
+    decode_tokens_per_second: float
+    memory_overhead_mb: float
+    max_abs_error: float
+    last_token_only: bool
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -249,6 +270,7 @@ class BenchmarkReport:
     checkpoint_profiles: list[ActivationCheckpointBenchmarkMetrics] = field(default_factory=list)
     optimizer_profiles: list[OptimizerBenchmarkMetrics] = field(default_factory=list)
     rmsnorm_fusion_profiles: list[RMSNormFusionBenchmarkMetrics] = field(default_factory=list)
+    attention_profiles: list[AttentionBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -1668,6 +1690,322 @@ class BenchmarkHarness:
             rmsnorm_fusion_profiles=self.run_phase8_rmsnorm_fusion_benchmarks(),
         )
 
+    @staticmethod
+    def _phase9_tensor_bytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def _phase9_deterministic_qkv(
+        self,
+        *,
+        batch_size: int,
+        num_heads: int,
+        sequence_length: int,
+        head_dim: int,
+        offset: int,
+    ) -> torch.Tensor:
+        dtype = self._phase8_dtype(self.device)
+        total = batch_size * num_heads * sequence_length * head_dim
+        values = torch.arange(offset, offset + total, dtype=torch.float32)
+        values = values.remainder(89).sub(44.0).div(13.0)
+        return values.reshape(batch_size, num_heads, sequence_length, head_dim).to(
+            device=self.device,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _phase9_cache_config() -> SimpleNamespace:
+        return SimpleNamespace(num_hidden_layers=1)
+
+    def _phase9_build_cache(
+        self,
+        *,
+        cache_layout: str,
+        prompt_k: torch.Tensor,
+        prompt_v: torch.Tensor,
+        batch_size: int,
+        max_cache_len: int,
+    ):
+        if cache_layout == "none":
+            return None
+        cache = create_kv_cache(
+            self._phase9_cache_config(),
+            max_batch_size=batch_size,
+            max_cache_len=max_cache_len,
+            mode=cache_layout,
+        )
+        cache.layers[0].update(prompt_k.contiguous(), prompt_v.contiguous())
+        return cache
+
+    def _phase9_memory_overhead_mb(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        output: torch.Tensor,
+        backend: str,
+        cache=None,
+    ) -> float:
+        overhead_bytes = self._phase9_tensor_bytes(output)
+        if backend != "flash_attention_2":
+            overhead_bytes += self._phase9_tensor_bytes(query) + self._phase9_tensor_bytes(key)
+        if cache is not None:
+            cached_k, cached_v = materialize_kv_for_attention(cache)
+            overhead_bytes += self._phase9_tensor_bytes(cached_k) + self._phase9_tensor_bytes(cached_v)
+        return overhead_bytes / (1024**2)
+
+    def _run_phase9_prefill_case(
+        self,
+        *,
+        batch_size: int,
+        prompt_length: int,
+        num_heads: int,
+        head_dim: int,
+        backend: str,
+    ) -> dict[str, object]:
+        q = self._phase9_deterministic_qkv(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            sequence_length=prompt_length,
+            head_dim=head_dim,
+            offset=0,
+        )
+        k = self._phase9_deterministic_qkv(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            sequence_length=prompt_length,
+            head_dim=head_dim,
+            offset=101,
+        )
+        v = self._phase9_deterministic_qkv(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            sequence_length=prompt_length,
+            head_dim=head_dim,
+            offset=203,
+        )
+
+        self._sync_device()
+        start_time = time.time()
+        output, decision = dispatch_attention(
+            q,
+            k,
+            v,
+            requested_backend=backend,
+            prefer_flash_attention=backend == "flash_attention_2",
+        )
+        self._sync_device()
+        total_time = time.time() - start_time
+        return {
+            "output": output,
+            "decision": decision,
+            "total_time_seconds": total_time,
+            "tokens_per_second": batch_size * prompt_length / max(total_time, 1e-9),
+            "memory_overhead_mb": self._phase9_memory_overhead_mb(
+                query=q,
+                key=k,
+                output=output,
+                backend=decision.backend,
+            ),
+        }
+
+    def _run_phase9_decode_case(
+        self,
+        *,
+        batch_size: int,
+        prompt_length: int,
+        decode_length: int,
+        cache_layout: str,
+        num_heads: int,
+        head_dim: int,
+        backend: str,
+    ) -> dict[str, object]:
+        prompt_k = self._phase9_deterministic_qkv(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            sequence_length=prompt_length,
+            head_dim=head_dim,
+            offset=307,
+        )
+        prompt_v = self._phase9_deterministic_qkv(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            sequence_length=prompt_length,
+            head_dim=head_dim,
+            offset=509,
+        )
+        cache = self._phase9_build_cache(
+            cache_layout=cache_layout,
+            prompt_k=prompt_k,
+            prompt_v=prompt_v,
+            batch_size=batch_size,
+            max_cache_len=prompt_length + decode_length + 8,
+        )
+
+        outputs = []
+        max_memory_overhead_mb = 0.0
+        last_decision = None
+
+        self._sync_device()
+        start_time = time.time()
+        for step in range(decode_length):
+            q_step = self._phase9_deterministic_qkv(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                sequence_length=1,
+                head_dim=head_dim,
+                offset=701 + step * 13,
+            )
+            k_step = self._phase9_deterministic_qkv(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                sequence_length=1,
+                head_dim=head_dim,
+                offset=907 + step * 17,
+            )
+            v_step = self._phase9_deterministic_qkv(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                sequence_length=1,
+                head_dim=head_dim,
+                offset=1103 + step * 19,
+            )
+            output, decision = dispatch_attention(
+                q_step,
+                k_step,
+                v_step,
+                cache=cache,
+                last_token_only=True,
+                requested_backend=backend,
+            )
+            outputs.append(output)
+            last_decision = decision
+            max_memory_overhead_mb = max(
+                max_memory_overhead_mb,
+                self._phase9_memory_overhead_mb(
+                    query=q_step,
+                    key=k_step,
+                    output=output,
+                    backend=decision.backend,
+                    cache=cache,
+                ),
+            )
+            cache.layers[0].update(k_step.contiguous(), v_step.contiguous())
+        self._sync_device()
+        total_time = time.time() - start_time
+
+        return {
+            "output": torch.cat(outputs, dim=-2) if outputs else torch.empty(0, device=self.device),
+            "decision": last_decision,
+            "total_time_seconds": total_time,
+            "tokens_per_second": batch_size * decode_length / max(total_time, 1e-9),
+            "memory_overhead_mb": max_memory_overhead_mb,
+        }
+
+    def run_phase9_attention_benchmarks(self) -> list[AttentionBenchmarkMetrics]:
+        """Run the Phase 9 attention dispatch benchmark matrix."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 9 Attention Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Batch Sizes: {', '.join(str(size) for size in self.inference_batch_sizes)}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        self.setup_model_and_tokenizer()
+        hidden_size, _ = self._phase8_model_dimensions()
+        num_heads, head_dim = self._phase5_attention_layout(hidden_size)
+        profiles = phase9_attention_profiles(
+            self.inference_batch_sizes,
+            short_prompt_length=self.short_prompt_length,
+            long_prompt_length=self.long_prompt_length,
+            short_decode_length=self.short_decode_length,
+            long_decode_length=self.long_decode_length,
+        )
+
+        metrics: list[AttentionBenchmarkMetrics] = []
+        baselines: dict[tuple[str, int, int, int, str], dict[str, object]] = {}
+        for profile in profiles:
+            backends = ("sdpa", "flash_attention_2") if profile.name == "prefill_throughput" else (
+                "sdpa",
+                "barqtrain_native_decode",
+            )
+            for backend in backends:
+                if profile.name == "prefill_throughput":
+                    run = self._run_phase9_prefill_case(
+                        batch_size=profile.batch_size,
+                        prompt_length=profile.prompt_length,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        backend=backend,
+                    )
+                else:
+                    run = self._run_phase9_decode_case(
+                        batch_size=profile.batch_size,
+                        prompt_length=profile.prompt_length,
+                        decode_length=profile.decode_length,
+                        cache_layout=profile.cache_layout,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        backend=backend,
+                    )
+
+                key = (
+                    profile.name,
+                    profile.batch_size,
+                    profile.prompt_length,
+                    profile.decode_length,
+                    profile.cache_layout,
+                )
+                baseline = baselines.get(key)
+                if baseline is None:
+                    baseline = run
+                    baselines[key] = run
+
+                metric = AttentionBenchmarkMetrics(
+                    scenario_name=profile.name,
+                    attention_backend=str(run["decision"].backend),
+                    cache_layout=profile.cache_layout,
+                    batch_size=profile.batch_size,
+                    prompt_length=profile.prompt_length,
+                    decode_length=profile.decode_length,
+                    prefill_tokens_per_second=(
+                        float(run["tokens_per_second"]) if profile.name == "prefill_throughput" else 0.0
+                    ),
+                    decode_tokens_per_second=(
+                        float(run["tokens_per_second"]) if profile.name != "prefill_throughput" else 0.0
+                    ),
+                    memory_overhead_mb=float(run["memory_overhead_mb"]),
+                    max_abs_error=float(
+                        (baseline["output"] - run["output"]).abs().max().item()
+                    ),
+                    last_token_only=bool(getattr(run["decision"], "last_token_only", False)),
+                )
+                metrics.append(metric)
+
+                throughput = (
+                    metric.prefill_tokens_per_second
+                    if metric.scenario_name == "prefill_throughput"
+                    else metric.decode_tokens_per_second
+                )
+                print(
+                    f"{metric.scenario_name} | backend={metric.attention_backend} | "
+                    f"layout={metric.cache_layout} | bs={metric.batch_size} | "
+                    f"tok/s={throughput:.1f} | mem_overhead={metric.memory_overhead_mb:.2f} MB | "
+                    f"max_err={metric.max_abs_error:.6e}"
+                )
+
+        return metrics
+
+    def run_phase9_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 9 attention dispatch benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase9",
+            attention_profiles=self.run_phase9_attention_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -1860,6 +2198,8 @@ class BenchmarkHarness:
                 filename = "phase7_results.json"
             elif results.benchmark_suite == "phase8":
                 filename = "phase8_results.json"
+            elif results.benchmark_suite == "phase9":
+                filename = "phase9_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -1986,6 +2326,22 @@ class BenchmarkHarness:
                     f"{best_profile.memory_traffic_reduction_percent:.1f}% / "
                     f"{best_profile.max_abs_error:.6e}"
                 )
+            if results.attention_profiles:
+                best_profile = max(
+                    results.attention_profiles,
+                    key=lambda metric: metric.prefill_tokens_per_second + metric.decode_tokens_per_second,
+                )
+                print(
+                    f"Fastest Attention Scenario: {best_profile.scenario_name} "
+                    f"({best_profile.attention_backend}, bs={best_profile.batch_size})"
+                )
+                print(
+                    f"Attention Throughput/Overhead/Parity: "
+                    f"{best_profile.prefill_tokens_per_second:.1f} / "
+                    f"{best_profile.decode_tokens_per_second:.1f} / "
+                    f"{best_profile.memory_overhead_mb:.2f} MB / "
+                    f"{best_profile.max_abs_error:.6e}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -2024,7 +2380,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"],
+        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -2135,6 +2491,8 @@ def main() -> None:
         results = harness.run_phase7_benchmarks()
     elif args.suite == "phase8":
         results = harness.run_phase8_benchmarks()
+    elif args.suite == "phase9":
+        results = harness.run_phase9_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:

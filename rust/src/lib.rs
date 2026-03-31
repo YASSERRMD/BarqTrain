@@ -379,6 +379,42 @@ impl RMSNormFusionBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 9 attention benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct AttentionBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub prompt_length: usize,
+    #[pyo3(get)]
+    pub decode_length: usize,
+    #[pyo3(get)]
+    pub cache_layout: String,
+}
+
+#[pymethods]
+impl AttentionBenchmarkProfile {
+    #[new]
+    fn new(
+        name: String,
+        batch_size: usize,
+        prompt_length: usize,
+        decode_length: usize,
+        cache_layout: String,
+    ) -> Self {
+        Self {
+            name,
+            batch_size,
+            prompt_length,
+            decode_length,
+            cache_layout,
+        }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -751,6 +787,49 @@ fn phase8_rmsnorm_fusion_profiles(
             sequence_length,
             hidden_size,
             projection_size: mlp_projection_size,
+        });
+    }
+    profiles
+}
+
+/// Emit the required Phase 9 attention benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    short_prompt_length=64,
+    long_prompt_length=1024,
+    short_decode_length=32,
+    long_decode_length=256
+))]
+fn phase9_attention_profiles(
+    batch_sizes: Vec<usize>,
+    short_prompt_length: usize,
+    long_prompt_length: usize,
+    short_decode_length: usize,
+    long_decode_length: usize,
+) -> Vec<AttentionBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 3);
+    for batch_size in batch_sizes {
+        profiles.push(AttentionBenchmarkProfile {
+            name: "prefill_throughput".to_string(),
+            batch_size,
+            prompt_length: long_prompt_length,
+            decode_length: 0,
+            cache_layout: "none".to_string(),
+        });
+        profiles.push(AttentionBenchmarkProfile {
+            name: "decode_throughput".to_string(),
+            batch_size,
+            prompt_length: short_prompt_length,
+            decode_length: long_decode_length,
+            cache_layout: "paged".to_string(),
+        });
+        profiles.push(AttentionBenchmarkProfile {
+            name: "long_context_serving".to_string(),
+            batch_size,
+            prompt_length: long_prompt_length.saturating_mul(2),
+            decode_length: short_decode_length,
+            cache_layout: "paged_quantized".to_string(),
         });
     }
     profiles
@@ -1256,6 +1335,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ActivationCheckpointBenchmarkProfile>()?;
     m.add_class::<OptimizerBenchmarkProfile>()?;
     m.add_class::<RMSNormFusionBenchmarkProfile>()?;
+    m.add_class::<AttentionBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -1272,5 +1352,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase6_activation_checkpoint_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase7_optimizer_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase8_rmsnorm_fusion_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase9_attention_profiles, m)?)?;
     Ok(())
 }

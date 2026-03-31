@@ -621,3 +621,51 @@ def test_phase8_rmsnorm_fusion_report_serializes_latency_and_traffic(monkeypatch
     assert "approximate_memory_traffic_mb" in payload
     assert "memory_traffic_reduction_percent" in payload
     assert "max_abs_error" in payload
+
+
+def test_phase9_attention_report_serializes_dispatch_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+        short_prompt_length=4,
+        long_prompt_length=8,
+        short_decode_length=2,
+        long_decode_length=4,
+    )
+
+    report = harness.run_phase9_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase9"
+    assert len(report.attention_profiles) == 12
+    assert {profile.scenario_name for profile in report.attention_profiles} == {
+        "prefill_throughput",
+        "decode_throughput",
+        "long_context_serving",
+    }
+    assert {profile.attention_backend for profile in report.attention_profiles} == {
+        "sdpa",
+        "flash_attention_2",
+        "barqtrain_native_decode",
+    }
+    decode_profiles = [
+        profile for profile in report.attention_profiles if profile.scenario_name != "prefill_throughput"
+    ]
+    assert all(profile.last_token_only is True for profile in decode_profiles)
+    assert all(profile.max_abs_error < 1e-5 for profile in report.attention_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase9_results.json"
+    assert "attention_backend" in payload
+    assert "prefill_tokens_per_second" in payload
+    assert "decode_tokens_per_second" in payload
+    assert "memory_overhead_mb" in payload
+    assert "max_abs_error" in payload
