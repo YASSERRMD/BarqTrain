@@ -6,8 +6,8 @@ This plan turns the project into a native memory-and-throughput stack in phased,
 
 Status update:
 
-- Phases 1 through 7 are now shipped in BarqTrain.
-- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 8.
+- Phases 1 through 8 are now shipped in BarqTrain.
+- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 9.
 
 ## Objective
 
@@ -29,10 +29,11 @@ What BarqTrain already does in native code:
 - CUDA paged and quantized KV-cache paths with runtime selection and reporting
 - activation-checkpointing presets for attention/MLP hot paths plus stability/VRAM benchmarks
 - native optimizer-state layouts with full, compact, and paged AdamW-compatible modes
+- RMSNorm block-fusion helpers and benchmark reporting for residual-add, attention-projection, and MLP-projection patterns
 
 What is still missing for the remaining roadmap:
 
-- deeper block fusion and decode-heavy attention fusion
+- decode-heavy attention fusion and deeper fused LoRA
 
 ## Why The Current Inference VRAM Barely Moves
 
