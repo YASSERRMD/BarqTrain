@@ -42,6 +42,7 @@ from barqtrain.memory import (
     phase5_packed_training_profiles,
     phase6_activation_checkpoint_profiles,
     phase7_optimizer_profiles,
+    phase8_rmsnorm_fusion_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
 )
@@ -51,11 +52,14 @@ from barqtrain.checkpointing import (
 )
 from barqtrain.ops import (
     chunked_cross_entropy_loss,
+    fused_residual_rms_norm,
     padding_free_attention,
     padding_free_chunked_cross_entropy_loss,
+    fused_rms_norm,
+    fused_rms_norm_linear,
 )
 from barqtrain.optim import create_optimizer, optimizer_state_bytes
-from barqtrain.patch_models import patch_inference, patch_model
+from barqtrain.patch_models import patch_inference, patch_model, refresh_rmsnorm_block_fusion_sites
 
 
 @dataclass
@@ -212,6 +216,23 @@ class OptimizerBenchmarkMetrics:
 
 
 @dataclass
+class RMSNormFusionBenchmarkMetrics:
+    """Benchmark metrics for Phase 8 RMSNorm block-fusion comparisons."""
+
+    scenario_name: str
+    fusion_mode: str
+    batch_size: int
+    sequence_length: int
+    hidden_size: int
+    projection_size: int
+    latency_seconds: float
+    effective_tokens_per_second: float
+    approximate_memory_traffic_mb: float
+    memory_traffic_reduction_percent: float
+    max_abs_error: float
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -227,6 +248,7 @@ class BenchmarkReport:
     packed_training_profiles: list[PackedTrainingBenchmarkMetrics] = field(default_factory=list)
     checkpoint_profiles: list[ActivationCheckpointBenchmarkMetrics] = field(default_factory=list)
     optimizer_profiles: list[OptimizerBenchmarkMetrics] = field(default_factory=list)
+    rmsnorm_fusion_profiles: list[RMSNormFusionBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -1443,6 +1465,209 @@ class BenchmarkHarness:
             optimizer_profiles=self.run_phase7_optimizer_benchmarks(),
         )
 
+    def _phase8_model_dimensions(self) -> tuple[int, int]:
+        if self.model is None:
+            self.setup_model_and_tokenizer()
+
+        config = getattr(self.model, "config", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None and hasattr(self.model, "get_input_embeddings"):
+            embedding = self.model.get_input_embeddings()
+            if embedding is not None and hasattr(embedding, "weight"):
+                hidden_size = int(embedding.weight.shape[-1])
+        hidden_size = int(hidden_size or max(self.sequence_length, 8))
+
+        intermediate_size = getattr(config, "intermediate_size", None)
+        intermediate_size = int(intermediate_size or max(hidden_size * 4, hidden_size))
+        return hidden_size, intermediate_size
+
+    @staticmethod
+    def _phase8_dtype(device: torch.device) -> torch.dtype:
+        if device.type == "cuda":
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.float32
+
+    @staticmethod
+    def _phase8_tensor_bytes(shape: Sequence[int], dtype: torch.dtype) -> int:
+        return int(math.prod(int(dim) for dim in shape)) * torch.tensor([], dtype=dtype).element_size()
+
+    def _phase8_approximate_memory_traffic_bytes(
+        self,
+        *,
+        scenario_name: str,
+        batch_size: int,
+        sequence_length: int,
+        hidden_size: int,
+        projection_size: int,
+        fused: bool,
+        dtype: torch.dtype,
+    ) -> int:
+        activation_bytes = self._phase8_tensor_bytes((batch_size, sequence_length, hidden_size), dtype)
+        output_bytes = self._phase8_tensor_bytes((batch_size, sequence_length, projection_size), dtype)
+        norm_weight_bytes = self._phase8_tensor_bytes((hidden_size,), dtype)
+        projection_weight_bytes = self._phase8_tensor_bytes((projection_size, hidden_size), dtype)
+
+        if scenario_name == "residual_add_rmsnorm":
+            if fused:
+                return activation_bytes * 3 + norm_weight_bytes
+            return activation_bytes * 5 + norm_weight_bytes
+
+        if fused:
+            return activation_bytes + output_bytes + norm_weight_bytes + projection_weight_bytes
+        return activation_bytes * 3 + output_bytes + norm_weight_bytes + projection_weight_bytes
+
+    def _run_phase8_fusion_case(
+        self,
+        *,
+        scenario_name: str,
+        batch_size: int,
+        sequence_length: int,
+        hidden_size: int,
+        projection_size: int,
+        fused: bool,
+    ) -> dict[str, object]:
+        dtype = self._phase8_dtype(self.device)
+
+        def deterministic_tensor(shape: Sequence[int], *, offset: int = 0) -> torch.Tensor:
+            total = int(math.prod(int(dim) for dim in shape))
+            values = torch.arange(offset, offset + total, dtype=torch.float32)
+            values = values.remainder(97).sub(48.0).div(17.0)
+            return values.reshape(*shape).to(device=self.device, dtype=dtype)
+
+        x = deterministic_tensor((batch_size, sequence_length, hidden_size), offset=0)
+        residual = deterministic_tensor((batch_size, sequence_length, hidden_size), offset=11)
+        norm_weight = deterministic_tensor((hidden_size,), offset=23).abs().add(0.5)
+        projection_weight = deterministic_tensor((projection_size, hidden_size), offset=37)
+
+        self._sync_device()
+        start_time = time.time()
+        with torch.no_grad():
+            if scenario_name == "residual_add_rmsnorm":
+                output = (
+                    fused_residual_rms_norm(x, residual, norm_weight)
+                    if fused
+                    else fused_rms_norm(x + residual, norm_weight)
+                )
+            else:
+                output = (
+                    fused_rms_norm_linear(x, norm_weight, projection_weight)
+                    if fused
+                    else torch.nn.functional.linear(
+                        fused_rms_norm(x, norm_weight),
+                        projection_weight,
+                    )
+                )
+        self._sync_device()
+        latency_seconds = time.time() - start_time
+        approximate_memory_traffic_bytes = self._phase8_approximate_memory_traffic_bytes(
+            scenario_name=scenario_name,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            hidden_size=hidden_size,
+            projection_size=projection_size,
+            fused=fused,
+            dtype=dtype,
+        )
+        return {
+            "output": output,
+            "latency_seconds": latency_seconds,
+            "approximate_memory_traffic_bytes": approximate_memory_traffic_bytes,
+        }
+
+    def run_phase8_rmsnorm_fusion_benchmarks(self) -> list[RMSNormFusionBenchmarkMetrics]:
+        """Run the Phase 8 RMSNorm block-fusion benchmark matrix."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 8 RMSNorm Fusion Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Batch Sizes: {', '.join(str(size) for size in self.inference_batch_sizes)}")
+        print(f"Sequence Length: {self.sequence_length}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        self.setup_model_and_tokenizer()
+        hidden_size, intermediate_size = self._phase8_model_dimensions()
+        self.model = patch_model(self.model)
+        fusion_sites = refresh_rmsnorm_block_fusion_sites(self.model)
+        profiles = phase8_rmsnorm_fusion_profiles(
+            self.inference_batch_sizes,
+            sequence_length=self.sequence_length,
+            hidden_size=hidden_size,
+            attention_projection_size=hidden_size,
+            mlp_projection_size=intermediate_size,
+        )
+
+        print(f"Identified {len(fusion_sites)} RMSNorm fusion call site(s) on the patched model.")
+
+        metrics: list[RMSNormFusionBenchmarkMetrics] = []
+        baselines: dict[tuple[str, int, int, int, int], dict[str, object]] = {}
+        for fusion_mode, fused in (("separated", False), ("fused", True)):
+            for profile in profiles:
+                run = self._run_phase8_fusion_case(
+                    scenario_name=profile.name,
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    hidden_size=profile.hidden_size,
+                    projection_size=profile.projection_size,
+                    fused=fused,
+                )
+                key = (
+                    profile.name,
+                    profile.batch_size,
+                    profile.sequence_length,
+                    profile.hidden_size,
+                    profile.projection_size,
+                )
+                baseline = baselines.get(key)
+                if baseline is None:
+                    baseline = run
+                    baselines[key] = run
+
+                baseline_output = baseline["output"]
+                current_output = run["output"]
+                max_abs_error = float((baseline_output - current_output).abs().max().item())
+                baseline_traffic_bytes = max(int(baseline["approximate_memory_traffic_bytes"]), 1)
+                current_traffic_bytes = int(run["approximate_memory_traffic_bytes"])
+                metric = RMSNormFusionBenchmarkMetrics(
+                    scenario_name=profile.name,
+                    fusion_mode=fusion_mode,
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    hidden_size=profile.hidden_size,
+                    projection_size=profile.projection_size,
+                    latency_seconds=float(run["latency_seconds"]),
+                    effective_tokens_per_second=(
+                        profile.batch_size * profile.sequence_length / max(float(run["latency_seconds"]), 1e-9)
+                    ),
+                    approximate_memory_traffic_mb=current_traffic_bytes / (1024**2),
+                    memory_traffic_reduction_percent=(
+                        (baseline_traffic_bytes - current_traffic_bytes) / baseline_traffic_bytes * 100.0
+                    ),
+                    max_abs_error=max_abs_error,
+                )
+                metrics.append(metric)
+
+                print(
+                    f"{metric.scenario_name} | mode={metric.fusion_mode} | "
+                    f"bs={metric.batch_size} | latency={metric.latency_seconds:.6f}s | "
+                    f"tok/s={metric.effective_tokens_per_second:.1f} | "
+                    f"traffic={metric.approximate_memory_traffic_mb:.2f} MB | "
+                    f"traffic_delta={metric.memory_traffic_reduction_percent:.1f}% | "
+                    f"max_err={metric.max_abs_error:.6e}"
+                )
+
+        return metrics
+
+    def run_phase8_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 8 RMSNorm block-fusion benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase8",
+            rmsnorm_fusion_profiles=self.run_phase8_rmsnorm_fusion_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -1633,6 +1858,8 @@ class BenchmarkHarness:
                 filename = "phase6_results.json"
             elif results.benchmark_suite == "phase7":
                 filename = "phase7_results.json"
+            elif results.benchmark_suite == "phase8":
+                filename = "phase8_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -1744,6 +1971,21 @@ class BenchmarkHarness:
                     f"{best_profile.optimizer_state_mb:.2f} MB / "
                     f"{best_profile.loss_delta_vs_adamw:.6f}"
                 )
+            if results.rmsnorm_fusion_profiles:
+                fused_profiles = [
+                    metric for metric in results.rmsnorm_fusion_profiles if metric.fusion_mode == "fused"
+                ] or results.rmsnorm_fusion_profiles
+                best_profile = min(fused_profiles, key=lambda metric: metric.latency_seconds)
+                print(
+                    f"Fastest RMSNorm Fusion Scenario: {best_profile.scenario_name} "
+                    f"(bs={best_profile.batch_size}, {best_profile.latency_seconds:.6f}s)"
+                )
+                print(
+                    f"RMSNorm Fusion Traffic/Parity: "
+                    f"{best_profile.approximate_memory_traffic_mb:.2f} MB / "
+                    f"{best_profile.memory_traffic_reduction_percent:.1f}% / "
+                    f"{best_profile.max_abs_error:.6e}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -1782,7 +2024,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7"],
+        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -1891,6 +2133,8 @@ def main() -> None:
         results = harness.run_phase6_benchmarks()
     elif args.suite == "phase7":
         results = harness.run_phase7_benchmarks()
+    elif args.suite == "phase8":
+        results = harness.run_phase8_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:

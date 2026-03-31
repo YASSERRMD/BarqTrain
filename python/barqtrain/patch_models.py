@@ -9,6 +9,7 @@ import importlib
 import importlib.util
 import inspect
 import types
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
 
@@ -22,6 +23,7 @@ def _apply_patch_once(model: torch.nn.Module, patch_fn) -> torch.nn.Module:
     if getattr(model, "_barqtrain_model_patched", False):
         return model
     patched_model = patch_fn(model)
+    refresh_rmsnorm_block_fusion_sites(patched_model)
     setattr(patched_model, "_barqtrain_model_patched", True)
     return patched_model
 
@@ -57,6 +59,127 @@ def _configure_attention_backend(model: torch.nn.Module, model_label: str) -> Op
 
     print(f"BarqTrain: Enabled {backend} attention backend for {model_label}")
     return backend
+
+
+@dataclass(frozen=True)
+class RMSNormFusionSite:
+    """
+    A common transformer call site where BarqTrain can apply deeper RMSNorm fusion.
+    """
+
+    pattern: str
+    module_path: str
+    norm_path: str
+    consumer_path: str
+
+
+def _named_child_module(parent: torch.nn.Module, attr_name: str) -> Optional[torch.nn.Module]:
+    child = getattr(parent, attr_name, None)
+    return child if isinstance(child, torch.nn.Module) else None
+
+
+def _join_module_path(parent_path: str, child_name: str) -> str:
+    return f"{parent_path}.{child_name}" if parent_path else child_name
+
+
+def identify_rmsnorm_block_fusion_sites(model: torch.nn.Module) -> list[RMSNormFusionSite]:
+    """
+    Inspect a model for common pre-attention and pre-MLP RMSNorm fusion opportunities.
+    """
+    pre_attention_norm_names = (
+        "input_layernorm",
+        "pre_attention_layernorm",
+        "attention_norm",
+        "attn_norm",
+    )
+    pre_mlp_norm_names = (
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "ffn_norm",
+        "mlp_norm",
+    )
+    attention_consumer_names = ("self_attn", "attention", "attn")
+    mlp_consumer_names = ("mlp", "feed_forward", "ffn", "experts")
+
+    sites: list[RMSNormFusionSite] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for module_path, module in model.named_modules():
+        attention_consumer_path = None
+        mlp_consumer_path = None
+
+        for attr_name in attention_consumer_names:
+            if _named_child_module(module, attr_name) is not None:
+                attention_consumer_path = _join_module_path(module_path, attr_name)
+                break
+
+        for attr_name in mlp_consumer_names:
+            if _named_child_module(module, attr_name) is not None:
+                mlp_consumer_path = _join_module_path(module_path, attr_name)
+                break
+
+        for attr_name in pre_attention_norm_names:
+            if _named_child_module(module, attr_name) is None:
+                continue
+            norm_path = _join_module_path(module_path, attr_name)
+            for pattern, consumer_path in (
+                ("residual_add_rmsnorm", norm_path),
+                ("rmsnorm_attention_projection", attention_consumer_path),
+            ):
+                if consumer_path is None:
+                    continue
+                key = (pattern, module_path, norm_path, consumer_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sites.append(
+                    RMSNormFusionSite(
+                        pattern=pattern,
+                        module_path=module_path or "<root>",
+                        norm_path=norm_path,
+                        consumer_path=consumer_path,
+                    )
+                )
+
+        for attr_name in pre_mlp_norm_names:
+            if _named_child_module(module, attr_name) is None:
+                continue
+            norm_path = _join_module_path(module_path, attr_name)
+            for pattern, consumer_path in (
+                ("residual_add_rmsnorm", norm_path),
+                ("rmsnorm_mlp_projection", mlp_consumer_path),
+            ):
+                if consumer_path is None:
+                    continue
+                key = (pattern, module_path, norm_path, consumer_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sites.append(
+                    RMSNormFusionSite(
+                        pattern=pattern,
+                        module_path=module_path or "<root>",
+                        norm_path=norm_path,
+                        consumer_path=consumer_path,
+                    )
+                )
+
+    return sites
+
+
+def refresh_rmsnorm_block_fusion_sites(model: torch.nn.Module) -> tuple[RMSNormFusionSite, ...]:
+    """
+    Re-scan a model and store the currently visible RMSNorm block-fusion call sites.
+    """
+    sites = tuple(identify_rmsnorm_block_fusion_sites(model))
+    setattr(model, "_barqtrain_rmsnorm_block_fusion_sites", sites)
+    if sites:
+        pattern_counts: dict[str, int] = {}
+        for site in sites:
+            pattern_counts[site.pattern] = pattern_counts.get(site.pattern, 0) + 1
+        summary = ", ".join(f"{pattern}={count}" for pattern, count in sorted(pattern_counts.items()))
+        print(f"BarqTrain: Identified RMSNorm block-fusion sites ({summary})")
+    return sites
 
 
 @lru_cache(maxsize=256)
@@ -420,7 +543,9 @@ def patch_inference(model: torch.nn.Module) -> torch.nn.Module:
     model_type = getattr(model_config, "model_type", None) or "model"
     _configure_attention_backend(model, model_type)
     model = _patch_causal_lm_chunked_loss(model, model_type)
-    return _patch_generate_with_paged_kv(model, model_type)
+    model = _patch_generate_with_paged_kv(model, model_type)
+    refresh_rmsnorm_block_fusion_sites(model)
+    return model
 
 
 def _patch_rmsnorm_layers(

@@ -581,3 +581,43 @@ def test_phase7_optimizer_report_serializes_state_metrics(monkeypatch, tmp_path)
     assert "optimizer_state_mb" in payload
     assert "tokens_per_second" in payload
     assert "loss_delta_vs_adamw" in payload
+
+
+def test_phase8_rmsnorm_fusion_report_serializes_latency_and_traffic(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+    )
+
+    report = harness.run_phase8_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase8"
+    assert len(report.rmsnorm_fusion_profiles) == 12
+    assert {profile.scenario_name for profile in report.rmsnorm_fusion_profiles} == {
+        "residual_add_rmsnorm",
+        "attention_input_projection",
+        "mlp_input_projection",
+    }
+    assert {profile.fusion_mode for profile in report.rmsnorm_fusion_profiles} == {"separated", "fused"}
+    fused_profiles = [
+        profile for profile in report.rmsnorm_fusion_profiles if profile.fusion_mode == "fused"
+    ]
+    assert all(profile.memory_traffic_reduction_percent > 0.0 for profile in fused_profiles)
+    assert all(profile.max_abs_error < 1e-5 for profile in report.rmsnorm_fusion_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase8_results.json"
+    assert "fusion_mode" in payload
+    assert "latency_seconds" in payload
+    assert "approximate_memory_traffic_mb" in payload
+    assert "memory_traffic_reduction_percent" in payload
+    assert "max_abs_error" in payload

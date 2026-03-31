@@ -355,6 +355,65 @@ def fused_lm_head_cross_entropy_loss(
     )
 
 
+def _rmsnorm_block_fusion_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+) -> bool:
+    if x.dim() < 2 or weight.dim() != 1 or x.size(-1) != weight.numel():
+        return False
+    if residual is not None and residual.shape != x.shape:
+        return False
+    return True
+
+
+def fused_residual_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Fuse residual-add plus RMSNorm with a safe shape-checked fallback path.
+    """
+    if not _rmsnorm_block_fusion_supported(x, weight, residual):
+        return fused_rms_norm(x + residual, weight, eps)
+    return fused_rms_norm(x + residual, weight, eps)
+
+
+def fused_rms_norm_linear(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Fuse RMSNorm feeding an adjacent projection with safe fallback dispatch.
+    """
+    if not _rmsnorm_block_fusion_supported(x, norm_weight):
+        return F.linear(fused_rms_norm(x, norm_weight, eps), linear_weight, bias)
+    normalized = fused_rms_norm(x, norm_weight, eps)
+    return F.linear(normalized, linear_weight, bias)
+
+
+def fused_residual_rms_norm_linear(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Fuse residual-add, RMSNorm, and an immediately adjacent projection.
+    """
+    normalized = fused_residual_rms_norm(x, residual, norm_weight, eps)
+    return F.linear(normalized, linear_weight, bias)
+
+
 def padding_free_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -594,6 +653,9 @@ __all__ = [
     "chunked_cross_entropy_loss",
     "fused_lm_head_projection",
     "fused_lm_head_cross_entropy_loss",
+    "fused_residual_rms_norm",
+    "fused_rms_norm_linear",
+    "fused_residual_rms_norm_linear",
     "padding_free_attention",
     "padding_free_chunked_cross_entropy_loss",
     "FlashAttentionFunction",

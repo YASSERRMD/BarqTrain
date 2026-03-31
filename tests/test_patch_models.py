@@ -94,6 +94,56 @@ def test_patch_inference_wraps_generate_without_full_model_patch(monkeypatch):
     assert called["generate"] == 1
 
 
+def test_identify_rmsnorm_block_fusion_sites_finds_attention_and_mlp_patterns():
+    class ToyDecoderLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = torch.nn.LayerNorm(8)
+            self.self_attn = torch.nn.Linear(8, 8)
+            self.post_attention_layernorm = torch.nn.LayerNorm(8)
+            self.mlp = torch.nn.Linear(8, 16)
+
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([ToyDecoderLayer()])
+
+    model = ToyModel()
+
+    sites = patch_models.identify_rmsnorm_block_fusion_sites(model)
+
+    assert {site.pattern for site in sites} == {
+        "residual_add_rmsnorm",
+        "rmsnorm_attention_projection",
+        "rmsnorm_mlp_projection",
+    }
+    assert any(site.norm_path == "layers.0.input_layernorm" for site in sites)
+    assert any(site.consumer_path == "layers.0.self_attn" for site in sites)
+    assert any(site.consumer_path == "layers.0.mlp" for site in sites)
+
+
+def test_refresh_rmsnorm_block_fusion_sites_stores_sites_on_model():
+    class ToyDecoderLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = torch.nn.LayerNorm(8)
+            self.self_attn = torch.nn.Linear(8, 8)
+            self.post_attention_layernorm = torch.nn.LayerNorm(8)
+            self.mlp = torch.nn.Linear(8, 16)
+
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([ToyDecoderLayer()])
+
+    model = ToyModel()
+
+    sites = patch_models.refresh_rmsnorm_block_fusion_sites(model)
+
+    assert sites == getattr(model, "_barqtrain_rmsnorm_block_fusion_sites")
+    assert len(sites) == 4
+
+
 def test_patch_causal_lm_chunked_loss_uses_barqtrain_loss(monkeypatch):
     class TinyBackbone(torch.nn.Module):
         def __init__(self, hidden_size):
