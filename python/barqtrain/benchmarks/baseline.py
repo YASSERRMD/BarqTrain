@@ -45,6 +45,7 @@ from barqtrain.memory import (
     phase7_optimizer_profiles,
     phase8_rmsnorm_fusion_profiles,
     phase9_attention_profiles,
+    phase10_lora_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
 )
@@ -54,6 +55,7 @@ from barqtrain.checkpointing import (
     reset_activation_checkpointing,
 )
 from barqtrain.kv_cache import create_kv_cache
+from barqtrain.lora import patch_lora_modules
 from barqtrain.ops import (
     chunked_cross_entropy_loss,
     fused_residual_rms_norm,
@@ -254,6 +256,24 @@ class AttentionBenchmarkMetrics:
 
 
 @dataclass
+class LoRABenchmarkMetrics:
+    """Benchmark metrics for Phase 10 fused LoRA training comparisons."""
+
+    scenario_name: str
+    adapter_mode: str
+    batch_size: int
+    sequence_length: int
+    packed_training: bool
+    effective_tokens: int
+    step_time_seconds: float
+    effective_tokens_per_second: float
+    peak_vram_mb: float
+    loss_value: float
+    loss_delta_vs_reference: float
+    memory: BenchmarkMemoryBreakdown = field(default_factory=BenchmarkMemoryBreakdown)
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -271,6 +291,125 @@ class BenchmarkReport:
     optimizer_profiles: list[OptimizerBenchmarkMetrics] = field(default_factory=list)
     rmsnorm_fusion_profiles: list[RMSNormFusionBenchmarkMetrics] = field(default_factory=list)
     attention_profiles: list[AttentionBenchmarkMetrics] = field(default_factory=list)
+    lora_profiles: list[LoRABenchmarkMetrics] = field(default_factory=list)
+
+
+class _ReferenceLoRALinear(torch.nn.Module):
+    """Simple PEFT-style LoRA baseline used for Phase 10 comparisons."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.rank = rank
+        self.scaling = alpha / rank if rank > 0 else 1.0
+        self.base_weight = torch.nn.Parameter(torch.empty(out_features, in_features))
+        self.base_bias = torch.nn.Parameter(torch.empty(out_features)) if bias else None
+        self.lora_A = torch.nn.Parameter(torch.empty(rank, in_features))
+        self.lora_B = torch.nn.Parameter(torch.empty(out_features, rank))
+        self.lora_dropout = torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity()
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5.0))
+        if self.base_bias is not None:
+            bound = 1.0 / math.sqrt(self.base_weight.shape[1])
+            torch.nn.init.uniform_(self.base_bias, -bound, bound)
+        torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5.0))
+        torch.nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = torch.nn.functional.linear(x, self.base_weight, self.base_bias)
+        adapter_input = self.lora_dropout(x)
+        adapter_hidden = torch.nn.functional.linear(adapter_input, self.lora_A)
+        adapter = torch.nn.functional.linear(adapter_hidden, self.lora_B)
+        return base + adapter * self.scaling
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear_layer: torch.nn.Linear,
+        *,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ) -> "_ReferenceLoRALinear":
+        lora_layer = cls(
+            linear_layer.in_features,
+            linear_layer.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            bias=linear_layer.bias is not None,
+        )
+        with torch.no_grad():
+            lora_layer.base_weight.copy_(linear_layer.weight)
+            if linear_layer.bias is not None and lora_layer.base_bias is not None:
+                lora_layer.base_bias.copy_(linear_layer.bias)
+        return lora_layer
+
+
+def _patch_reference_lora_modules(
+    model: torch.nn.Module,
+    *,
+    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    freeze_base: bool = True,
+) -> torch.nn.Module:
+    replaced_modules: list[str] = []
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if not any(module_name == target or module_name.endswith(f".{target}") for target in target_modules):
+            continue
+
+        parent_path, _, child_name = module_name.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        lora_module = _ReferenceLoRALinear.from_linear(
+            module,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        if freeze_base:
+            lora_module.base_weight.requires_grad_(False)
+            if lora_module.base_bias is not None:
+                lora_module.base_bias.requires_grad_(False)
+        setattr(parent, child_name, lora_module)
+        replaced_modules.append(module_name)
+    setattr(model, "_barqtrain_reference_lora_modules", tuple(replaced_modules))
+    return model
+
+
+class _Phase10LoRABenchmarkModel(torch.nn.Module):
+    """Small adapter-heavy module for Phase 10 benchmark comparisons."""
+
+    def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+        self.q_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed(input_ids)
+
+    def adapter_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        q = torch.tanh(self.q_proj(hidden_states))
+        k = torch.sigmoid(self.k_proj(hidden_states))
+        v = torch.tanh(self.v_proj(hidden_states))
+        return self.o_proj((q + k) * v)
 
 
 @contextmanager
@@ -2006,6 +2145,278 @@ class BenchmarkHarness:
             attention_profiles=self.run_phase9_attention_benchmarks(),
         )
 
+    def _phase10_benchmark_dimensions(self) -> tuple[int, int]:
+        if self.model is None or self.tokenizer is None:
+            self.setup_model_and_tokenizer()
+
+        hidden_size, _ = self._phase8_model_dimensions()
+        hidden_size = int(max(16, min(hidden_size, 256)))
+
+        vocab_size = 512
+        if self.model is not None and hasattr(self.model, "get_input_embeddings"):
+            embedding = self.model.get_input_embeddings()
+            if embedding is not None and hasattr(embedding, "weight"):
+                vocab_size = int(max(64, min(int(embedding.weight.shape[0]), 2048)))
+
+        return hidden_size, vocab_size
+
+    @staticmethod
+    def _phase10_rank(hidden_size: int) -> int:
+        return max(2, min(8, hidden_size))
+
+    @staticmethod
+    def _phase10_capture_lora_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        state: dict[str, torch.Tensor] = {}
+        for module_name, module in model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                state[f"{module_name}.lora_A"] = module.lora_A.detach().clone()
+                state[f"{module_name}.lora_B"] = module.lora_B.detach().clone()
+        return state
+
+    def _phase10_build_model(
+        self,
+        *,
+        adapter_mode: str,
+        hidden_size: int,
+        vocab_size: int,
+        base_state: dict[str, torch.Tensor],
+        adapter_state: Optional[dict[str, torch.Tensor]] = None,
+    ) -> torch.nn.Module:
+        rank = self._phase10_rank(hidden_size)
+        model = _Phase10LoRABenchmarkModel(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+        ).to(self.device)
+        model.load_state_dict(copy.deepcopy(base_state))
+
+        if adapter_mode == "reference":
+            model = _patch_reference_lora_modules(
+                model,
+                rank=rank,
+                alpha=float(rank * 2),
+                dropout=0.0,
+                freeze_base=True,
+            )
+        elif adapter_mode == "barqtrain_fused":
+            model = patch_lora_modules(
+                model,
+                rank=rank,
+                alpha=float(rank * 2),
+                dropout=0.0,
+                freeze_base=True,
+            )
+        else:
+            raise ValueError(f"unsupported Phase 10 adapter mode: {adapter_mode}")
+
+        if adapter_state is not None:
+            with torch.no_grad():
+                for module_name, module in model.named_modules():
+                    if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+                        continue
+                    module.lora_A.copy_(adapter_state[f"{module_name}.lora_A"].to(module.lora_A))
+                    module.lora_B.copy_(adapter_state[f"{module_name}.lora_B"].to(module.lora_B))
+
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.endswith("lora_A") or name.endswith("lora_B"))
+
+        return model
+
+    def _run_phase10_training_step(
+        self,
+        *,
+        model: torch.nn.Module,
+        batch_size: int,
+        sequence_length: int,
+        packed_training: bool,
+    ) -> dict[str, float | int]:
+        examples = self._phase5_examples(batch_size, sequence_length)
+        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_parameters, lr=5e-4)
+        resident_model_bytes = model_resident_cuda_bytes(model)
+
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        optimizer.zero_grad(set_to_none=True)
+        self._sync_device()
+        start_time = time.time()
+
+        if not packed_training:
+            batch = self._build_padded_training_batch(examples, sequence_length)
+            hidden_states = model.encode(batch["input_ids"])
+            adapted = model.adapter_hidden(hidden_states)
+            loss = chunked_cross_entropy_loss(
+                adapted[:, :-1, :],
+                model.lm_head.weight,
+                batch["labels"][:, 1:],
+            )
+            effective_tokens = int(batch["labels"][:, 1:].ne(-100).sum().item())
+        else:
+            collator = PaddingFreeCausalLMDataCollator(
+                max_length=sequence_length,
+                pad_token_id=int(getattr(self.tokenizer, "pad_token_id", 0)),
+                eos_token_id=int(getattr(self.tokenizer, "eos_token_id", 0)),
+                document_masked=False,
+            )
+            batch = collator(examples)
+            input_ids = batch["input_ids"].to(self.device)
+            embedded = model.encode(input_ids)
+
+            flat_hidden_segments = []
+            flat_labels = []
+            flat_loss_masks = []
+
+            for index in range(embedded.size(0)):
+                active_tokens = int(batch["active_tokens"][index].item())
+                if active_tokens <= 0:
+                    continue
+                flat_hidden_segments.append(embedded[index, :active_tokens, :])
+                flat_labels.append(batch["labels"][index, :active_tokens].to(self.device))
+                loss_mask_block = batch["loss_mask"][index, :active_tokens].clone()
+                if index > 0 and active_tokens > 0:
+                    loss_mask_block[0] = 0
+                flat_loss_masks.append(loss_mask_block.to(self.device))
+
+            hidden_flat = torch.cat(flat_hidden_segments, dim=0)
+            labels_flat = torch.cat(flat_labels, dim=0)
+            loss_mask_flat = torch.cat(flat_loss_masks, dim=0)
+            adapted = model.adapter_hidden(hidden_flat).reshape(1, hidden_flat.size(0), -1)
+            loss = padding_free_chunked_cross_entropy_loss(
+                adapted[:, :-1, :],
+                model.lm_head.weight,
+                labels_flat[1:].unsqueeze(0),
+                loss_mask=loss_mask_flat[1:].unsqueeze(0),
+            )
+            effective_tokens = int(loss_mask_flat[1:].sum().item())
+
+        loss.backward()
+        optimizer.step()
+        self._sync_device()
+        total_time = time.time() - start_time
+
+        training_peak_bytes = capture_cuda_peak_bytes()
+        record_training_peak_bytes(training_peak_bytes)
+        return {
+            "resident_model_bytes": resident_model_bytes,
+            "training_peak_bytes": training_peak_bytes,
+            "step_time_seconds": total_time,
+            "effective_tokens": effective_tokens,
+            "loss_value": float(loss.detach().float().item()),
+        }
+
+    def run_phase10_lora_benchmarks(self) -> list[LoRABenchmarkMetrics]:
+        """Run the Phase 10 fused LoRA benchmark suite."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 10 Fused LoRA Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Batch Sizes: {', '.join(str(size) for size in self.inference_batch_sizes)}")
+        print(f"Sequence Length: {self.sequence_length}")
+        print(f"Detailed Profiling: {self.detailed_profiling}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        set_detailed_profiling_enabled(self.detailed_profiling)
+        self.setup_model_and_tokenizer()
+        hidden_size, vocab_size = self._phase10_benchmark_dimensions()
+        profiles = phase10_lora_profiles(
+            self.inference_batch_sizes,
+            sequence_length=self.sequence_length,
+        )
+
+        metrics: list[LoRABenchmarkMetrics] = []
+
+        for profile in profiles:
+            base_model = _Phase10LoRABenchmarkModel(vocab_size=vocab_size, hidden_size=hidden_size).to(self.device)
+            base_state = copy.deepcopy(base_model.state_dict())
+            del base_model
+
+            reference_model = self._phase10_build_model(
+                adapter_mode="reference",
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                base_state=base_state,
+            )
+            reference_adapter_state = self._phase10_capture_lora_state(reference_model)
+            reference_result = self._run_phase10_training_step(
+                model=reference_model,
+                batch_size=profile.batch_size,
+                sequence_length=profile.sequence_length,
+                packed_training=profile.packed_training,
+            )
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            fused_model = self._phase10_build_model(
+                adapter_mode="barqtrain_fused",
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                base_state=base_state,
+                adapter_state=reference_adapter_state,
+            )
+            fused_result = self._run_phase10_training_step(
+                model=fused_model,
+                batch_size=profile.batch_size,
+                sequence_length=profile.sequence_length,
+                packed_training=profile.packed_training,
+            )
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            for adapter_mode, result in (
+                ("reference", reference_result),
+                ("barqtrain_fused", fused_result),
+            ):
+                memory = build_memory_breakdown(
+                    resident_model_bytes=int(result["resident_model_bytes"]),
+                    kv_cache_bytes=0,
+                    temporary_decode_buffer_bytes=0,
+                    training_peak_bytes=int(result["training_peak_bytes"]),
+                    inference_peak_bytes=0,
+                    detailed_profiling=self.detailed_profiling,
+                )
+                metric = LoRABenchmarkMetrics(
+                    scenario_name=profile.name,
+                    adapter_mode=adapter_mode,
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    packed_training=profile.packed_training,
+                    effective_tokens=int(result["effective_tokens"]),
+                    step_time_seconds=float(result["step_time_seconds"]),
+                    effective_tokens_per_second=(
+                        float(result["effective_tokens"]) / max(float(result["step_time_seconds"]), 1e-9)
+                    ),
+                    peak_vram_mb=memory.training_peak_vram_mb,
+                    loss_value=float(result["loss_value"]),
+                    loss_delta_vs_reference=(
+                        float(result["loss_value"]) - float(reference_result["loss_value"])
+                    ),
+                    memory=memory,
+                )
+                metrics.append(metric)
+                print(
+                    f"{metric.scenario_name} | mode={metric.adapter_mode} | "
+                    f"bs={metric.batch_size} | packed={metric.packed_training} | "
+                    f"eff_tok/s={metric.effective_tokens_per_second:.1f} | "
+                    f"step={metric.step_time_seconds:.4f}s | "
+                    f"peak={metric.peak_vram_mb:.1f} MB | "
+                    f"loss_delta={metric.loss_delta_vs_reference:.6f}"
+                )
+
+            del reference_model
+            del fused_model
+
+        return metrics
+
+    def run_phase10_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 10 fused LoRA benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase10",
+            lora_profiles=self.run_phase10_lora_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -2200,6 +2611,8 @@ class BenchmarkHarness:
                 filename = "phase8_results.json"
             elif results.benchmark_suite == "phase9":
                 filename = "phase9_results.json"
+            elif results.benchmark_suite == "phase10":
+                filename = "phase10_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -2342,6 +2755,22 @@ class BenchmarkHarness:
                     f"{best_profile.memory_overhead_mb:.2f} MB / "
                     f"{best_profile.max_abs_error:.6e}"
                 )
+            if results.lora_profiles:
+                fused_profiles = [
+                    metric for metric in results.lora_profiles if metric.adapter_mode == "barqtrain_fused"
+                ] or results.lora_profiles
+                best_profile = max(fused_profiles, key=lambda metric: metric.effective_tokens_per_second)
+                print(
+                    f"Fastest Fused LoRA Scenario: {best_profile.scenario_name} "
+                    f"(bs={best_profile.batch_size}, packed={best_profile.packed_training})"
+                )
+                print(
+                    f"LoRA Throughput/Step/Peak/Loss Delta: "
+                    f"{best_profile.effective_tokens_per_second:.1f} / "
+                    f"{best_profile.step_time_seconds:.4f}s / "
+                    f"{best_profile.peak_vram_mb:.1f} MB / "
+                    f"{best_profile.loss_delta_vs_reference:.6f}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -2380,7 +2809,18 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9"],
+        choices=[
+            "phase1",
+            "phase2",
+            "phase3",
+            "phase4",
+            "phase5",
+            "phase6",
+            "phase7",
+            "phase8",
+            "phase9",
+            "phase10",
+        ],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -2493,6 +2933,8 @@ def main() -> None:
         results = harness.run_phase8_benchmarks()
     elif args.suite == "phase9":
         results = harness.run_phase9_benchmarks()
+    elif args.suite == "phase10":
+        results = harness.run_phase10_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:

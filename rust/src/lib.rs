@@ -415,6 +415,33 @@ impl AttentionBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 10 fused LoRA benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct LoRABenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub sequence_length: usize,
+    #[pyo3(get)]
+    pub packed_training: bool,
+}
+
+#[pymethods]
+impl LoRABenchmarkProfile {
+    #[new]
+    fn new(name: String, batch_size: usize, sequence_length: usize, packed_training: bool) -> Self {
+        Self {
+            name,
+            batch_size,
+            sequence_length,
+            packed_training,
+        }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -830,6 +857,34 @@ fn phase9_attention_profiles(
             prompt_length: long_prompt_length.saturating_mul(2),
             decode_length: short_decode_length,
             cache_layout: "paged_quantized".to_string(),
+        });
+    }
+    profiles
+}
+
+/// Emit the required Phase 10 fused LoRA benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    sequence_length=512
+))]
+fn phase10_lora_profiles(
+    batch_sizes: Vec<usize>,
+    sequence_length: usize,
+) -> Vec<LoRABenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 2);
+    for batch_size in batch_sizes {
+        profiles.push(LoRABenchmarkProfile {
+            name: "dense_chunked_loss".to_string(),
+            batch_size,
+            sequence_length,
+            packed_training: false,
+        });
+        profiles.push(LoRABenchmarkProfile {
+            name: "packed_chunked_loss".to_string(),
+            batch_size,
+            sequence_length,
+            packed_training: true,
         });
     }
     profiles
@@ -1336,6 +1391,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<OptimizerBenchmarkProfile>()?;
     m.add_class::<RMSNormFusionBenchmarkProfile>()?;
     m.add_class::<AttentionBenchmarkProfile>()?;
+    m.add_class::<LoRABenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -1353,5 +1409,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase7_optimizer_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase8_rmsnorm_fusion_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase9_attention_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase10_lora_profiles, m)?)?;
     Ok(())
 }
