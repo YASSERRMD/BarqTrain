@@ -33,11 +33,12 @@ from barqtrain.memory import (
     phase1_inference_profiles,
     phase2_kv_cache_profiles,
     phase3_quantized_kv_profiles,
+    phase4_vocab_projection_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
 )
 from barqtrain.optim import create_optimizer
-from barqtrain.patch_models import patch_inference
+from barqtrain.patch_models import patch_inference, patch_model
 
 
 @dataclass
@@ -124,6 +125,28 @@ class QuantizedKVBenchmarkMetrics:
 
 
 @dataclass
+class ProjectionBenchmarkMetrics:
+    """Benchmark metrics for Phase 4 fused projection/loss comparisons."""
+
+    scenario_name: str
+    projection_mode: str
+    batch_size: int
+    sequence_length: int
+    prompt_length: int
+    decode_length: int
+    vocab_size: int
+    training_step_time_seconds: float
+    decode_tokens_per_second: float
+    training_peak_vram_mb: float
+    inference_peak_vram_mb: float
+    training_loss: float
+    loss_delta_vs_baseline: float
+    generation_match_ratio: float
+    last_token_logits_only: bool
+    memory: BenchmarkMemoryBreakdown = field(default_factory=BenchmarkMemoryBreakdown)
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -135,6 +158,7 @@ class BenchmarkReport:
     inference_profiles: list[InferenceBenchmarkMetrics] = field(default_factory=list)
     kv_cache_profiles: list[KVCacheBenchmarkMetrics] = field(default_factory=list)
     quantized_kv_profiles: list[QuantizedKVBenchmarkMetrics] = field(default_factory=list)
+    projection_profiles: list[ProjectionBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -349,9 +373,14 @@ class BenchmarkHarness:
         prompt_length: int,
         batch_size: int,
         decode_length: int,
+        prefer_last_token_logits: bool = True,
     ) -> dict[str, object]:
         inputs = self._build_prompt_inputs(prompt_length, batch_size)
-        generation_kwargs = build_generation_kwargs(self.model, decode_length)
+        generation_kwargs = build_generation_kwargs(
+            self.model,
+            decode_length,
+            prefer_last_token_logits=prefer_last_token_logits,
+        )
 
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -688,6 +717,162 @@ class BenchmarkHarness:
 
         return metrics
 
+    def _run_projection_training_step(
+        self,
+        *,
+        batch_size: int,
+        sequence_length: int,
+        fused_projection: bool,
+    ) -> dict[str, float | int]:
+        self.model = patch_model(self.model)
+        self.model.train()
+        setattr(self.model, "_barqtrain_chunked_loss_enabled", fused_projection)
+
+        inputs = self._build_prompt_inputs(sequence_length, batch_size)
+        labels = inputs["input_ids"].clone()
+        resident_model_bytes = model_resident_cuda_bytes(self.model)
+
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        self.model.zero_grad(set_to_none=True)
+        self._sync_device()
+        start_time = time.time()
+        outputs = self.model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            labels=labels,
+        )
+        loss = outputs.loss
+        if loss is None:
+            raise RuntimeError("projection benchmark expected the model to return a loss")
+        loss.backward()
+        self._sync_device()
+        total_time = time.time() - start_time
+        training_peak_bytes = capture_cuda_peak_bytes()
+        record_training_peak_bytes(training_peak_bytes)
+        self.model.zero_grad(set_to_none=True)
+
+        return {
+            "resident_model_bytes": resident_model_bytes,
+            "training_peak_bytes": training_peak_bytes,
+            "training_step_time_seconds": total_time,
+            "training_loss": float(loss.detach().float().item()),
+        }
+
+    def run_phase4_vocab_projection_benchmarks(self) -> list[ProjectionBenchmarkMetrics]:
+        """Run the Phase 4 fused projection-plus-loss benchmark matrix."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 4 Projection Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Batch Sizes: {', '.join(str(size) for size in self.inference_batch_sizes)}")
+        print(f"Detailed Profiling: {self.detailed_profiling}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        set_detailed_profiling_enabled(self.detailed_profiling)
+        self.setup_model_and_tokenizer()
+        self.model = patch_model(self.model)
+        self._inference_patched = True
+
+        profiles = phase4_vocab_projection_profiles(
+            self.inference_batch_sizes,
+            sequence_length=self.sequence_length,
+            short_prompt_length=self.short_prompt_length,
+            long_prompt_length=self.long_prompt_length,
+            short_decode_length=self.short_decode_length,
+            long_decode_length=self.long_decode_length,
+        )
+
+        metrics: list[ProjectionBenchmarkMetrics] = []
+        baselines: dict[tuple[str, int], dict[str, object]] = {}
+
+        for projection_mode, fused_projection in (("baseline", False), ("fused", True)):
+            for profile in profiles:
+                training = self._run_projection_training_step(
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    fused_projection=fused_projection,
+                )
+                self.model.eval()
+                setattr(self.model, "_barqtrain_last_token_projection_enabled", fused_projection)
+
+                with torch.inference_mode():
+                    with _temporary_env(
+                        "BARQTRAIN_LAST_TOKEN_LOGITS_ONLY",
+                        "1" if fused_projection else "0",
+                    ):
+                        run = self._run_generate_call(
+                            prompt_length=profile.prompt_length,
+                            batch_size=profile.batch_size,
+                            decode_length=profile.decode_length,
+                            prefer_last_token_logits=fused_projection,
+                        )
+
+                key = (profile.name, profile.batch_size)
+                baseline = baselines.get(key)
+                if baseline is None:
+                    baseline = {
+                        "outputs": run["outputs"],
+                        "training_loss": float(training["training_loss"]),
+                    }
+                    baselines[key] = baseline
+
+                memory = build_memory_breakdown(
+                    resident_model_bytes=int(training["resident_model_bytes"]),
+                    kv_cache_bytes=int(run["kv_cache_bytes"]),
+                    temporary_decode_buffer_bytes=int(run["decode_temp_bytes"]),
+                    training_peak_bytes=int(training["training_peak_bytes"]),
+                    inference_peak_bytes=int(run["inference_peak_bytes"]),
+                    detailed_profiling=self.detailed_profiling,
+                )
+                generation_match_ratio = self._generation_match_ratio(
+                    baseline["outputs"],
+                    run["outputs"],
+                    profile.prompt_length,
+                )
+                metric = ProjectionBenchmarkMetrics(
+                    scenario_name=profile.name,
+                    projection_mode=projection_mode,
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    prompt_length=profile.prompt_length,
+                    decode_length=profile.decode_length,
+                    vocab_size=int(self.model.lm_head.weight.shape[0]),
+                    training_step_time_seconds=float(training["training_step_time_seconds"]),
+                    decode_tokens_per_second=float(run["total_new_tokens"]) / max(float(run["total_time"]), 1e-9),
+                    training_peak_vram_mb=memory.training_peak_vram_mb,
+                    inference_peak_vram_mb=memory.inference_peak_vram_mb,
+                    training_loss=float(training["training_loss"]),
+                    loss_delta_vs_baseline=float(training["training_loss"]) - float(baseline["training_loss"]),
+                    generation_match_ratio=generation_match_ratio,
+                    last_token_logits_only=bool(run["last_token_logits_only"]),
+                    memory=memory,
+                )
+                metrics.append(metric)
+
+                print(
+                    f"{metric.scenario_name} | mode={metric.projection_mode} | "
+                    f"bs={metric.batch_size} | train_step={metric.training_step_time_seconds:.4f}s | "
+                    f"decode={metric.decode_tokens_per_second:.1f} tok/s | "
+                    f"train_peak={metric.training_peak_vram_mb:.1f} MB | "
+                    f"inference_peak={metric.inference_peak_vram_mb:.1f} MB | "
+                    f"loss_delta={metric.loss_delta_vs_baseline:.6f} | "
+                    f"match={metric.generation_match_ratio:.3f}"
+                )
+
+        return metrics
+
+    def run_phase4_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 4 fused projection benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase4",
+            projection_profiles=self.run_phase4_vocab_projection_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -870,6 +1055,8 @@ class BenchmarkHarness:
                 filename = "phase2_results.json"
             elif results.benchmark_suite == "phase3":
                 filename = "phase3_results.json"
+            elif results.benchmark_suite == "phase4":
+                filename = "phase4_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -927,6 +1114,21 @@ class BenchmarkHarness:
                     f"{best_profile.generation_match_ratio:.3f} / "
                     f"{best_profile.perplexity if best_profile.perplexity is not None else 'n/a'}"
                 )
+            if results.projection_profiles:
+                fused_profiles = [
+                    metric for metric in results.projection_profiles if metric.projection_mode == "fused"
+                ] or results.projection_profiles
+                best_profile = max(fused_profiles, key=lambda metric: metric.decode_tokens_per_second)
+                print(
+                    f"Best Fused Projection Scenario: {best_profile.scenario_name} "
+                    f"(bs={best_profile.batch_size}, {best_profile.decode_tokens_per_second:.1f} tok/s)"
+                )
+                print(
+                    f"Projection Train Step/Peak/Match: "
+                    f"{best_profile.training_step_time_seconds:.4f}s / "
+                    f"{best_profile.training_peak_vram_mb:.1f} MB / "
+                    f"{best_profile.generation_match_ratio:.3f}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -965,7 +1167,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3"],
+        choices=["phase1", "phase2", "phase3", "phase4"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -1066,6 +1268,8 @@ def main() -> None:
             cache_layouts=phase3_layouts,
             quantized_residual_window_tokens=args.quantized_kv_residual_window_tokens,
         )
+    elif args.suite == "phase4":
+        results = harness.run_phase4_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:
