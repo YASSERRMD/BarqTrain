@@ -72,6 +72,7 @@ from barqtrain.checkpointing import (
     reset_activation_checkpointing,
 )
 from barqtrain.optim import BarqTrainAdamW, create_optimizer, optimizer_state_bytes
+from barqtrain.lora import FusedLoRALinear, fused_lora_linear, patch_lora_modules
 
 __all__ = [
     "patch_model",
@@ -113,5 +114,8 @@ __all__ = [
     "BarqTrainAdamW",
     "create_optimizer",
     "optimizer_state_bytes",
+    "FusedLoRALinear",
+    "fused_lora_linear",
+    "patch_lora_modules",
     "__version__",
 ]

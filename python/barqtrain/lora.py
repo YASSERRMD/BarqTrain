@@ -1,15 +1,10 @@
-"""
-LoRA (Low-Rank Adaptation) utilities for BarqTrain
+"""LoRA (Low-Rank Adaptation) utilities for BarqTrain."""
 
-This module provides fused LoRA implementations for efficient
-fine-tuning with reduced memory and compute overhead.
-"""
-
-from typing import Optional
-
+import math
 import warnings
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from barqtrain._ffi import load_cuda_backend
 
@@ -29,6 +24,17 @@ def _warn_cuda_fallback_once() -> None:
         "Install with: pip install -e ."
     )
     _CUDA_FALLBACK_WARNED = True
+
+
+def _reshape_lora_input(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+    original_shape = tuple(x.shape)
+    if x.dim() <= 2:
+        return x, original_shape
+    return x.reshape(-1, x.size(-1)), original_shape
+
+
+def _cast_lora_weight(weight: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    return weight.to(device=x.device, dtype=x.dtype)
 
 
 class FusedLoRAFunction(torch.autograd.Function):
@@ -64,22 +70,34 @@ class FusedLoRAFunction(torch.autograd.Function):
         Returns:
             Output tensor [batch_size, out_features]
         """
+        x_2d, original_shape = _reshape_lora_input(x)
+        W_base_cast = _cast_lora_weight(W_base, x_2d)
+        A_cast = _cast_lora_weight(A, x_2d)
+        B_cast = _cast_lora_weight(B, x_2d)
+
         cuda_backend = _get_cuda_backend()
-        if cuda_backend is not None:
+        if cuda_backend is not None and x_2d.is_cuda:
             # Use CUDA kernel
-            output = cuda_backend.fused_lora_forward(x, W_base, A, B, scaling)
-            ctx.save_for_backward(x, W_base, A, B)
-            ctx.scaling = scaling
-            return output
+            output = cuda_backend.fused_lora_forward(
+                x_2d.contiguous(),
+                W_base_cast.contiguous(),
+                A_cast.contiguous(),
+                B_cast.contiguous(),
+                scaling,
+            )
         else:
-            if x.is_cuda:
+            if x_2d.is_cuda:
                 _warn_cuda_fallback_once()
             # Fallback to PyTorch implementation
-            lora_output = x @ A.T @ B.T
-            output = x @ W_base.T + lora_output * scaling
-            ctx.save_for_backward(x, W_base, A, B)
-            ctx.scaling = scaling
-            return output
+            lora_output = x_2d @ A_cast.T @ B_cast.T
+            output = x_2d @ W_base_cast.T + lora_output * scaling
+
+        ctx.save_for_backward(x_2d, W_base_cast, A_cast, B_cast)
+        ctx.scaling = scaling
+        ctx.original_shape = original_shape
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], W_base.shape[0])
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
@@ -95,18 +113,14 @@ class FusedLoRAFunction(torch.autograd.Function):
         x, W_base, A, B = ctx.saved_tensors
         scaling = ctx.scaling
 
-        # Compute gradients
-        # For a production implementation, these would also be fused
-        # For now, use standard PyTorch autograd
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1]) if grad_output.dim() > 2 else grad_output
+        grad_x = grad_output_2d @ W_base + scaling * (grad_output_2d @ B @ A)
+        grad_W_base = grad_output_2d.T @ x
+        grad_A = scaling * (grad_output_2d @ B).T @ x
+        grad_B = scaling * grad_output_2d.T @ (x @ A.T)
 
-        # grad_x = grad_output @ W_base + scaling * grad_output @ B @ A
-        grad_W_base_part = grad_output.T @ x
-        lora_grad = (grad_output @ B.T * scaling).T @ x
-
-        grad_x = grad_output @ W_base + scaling * (grad_output @ B.T @ A.T)
-        grad_W_base = grad_output.T @ x
-        grad_A = scaling * (grad_output @ B.T).T @ x
-        grad_B = scaling * grad_output.T @ (x @ A.T)
+        if len(ctx.original_shape) > 2:
+            grad_x = grad_x.reshape(*ctx.original_shape)
 
         return grad_x, grad_W_base, grad_A, grad_B, None
 
@@ -196,14 +210,14 @@ class FusedLoRALinear(nn.Module):
     def reset_parameters(self):
         """Initialize parameters following LoRA best practices."""
         # Base weight initialization
-        nn.init.kaiming_uniform_(self.base_weight, a=torch.sqrt(torch.tensor(5.0)))
+        nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5.0))
         if self.base_bias is not None:
             fan_in = self.base_weight.shape[1]
-            bound = 1 / torch.sqrt(torch.tensor(fan_in))
+            bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.base_bias, -bound, bound)
 
         # LoRA initialization (A: Kaiming, B: zeros)
-        nn.init.kaiming_uniform_(self.lora_A, a=torch.sqrt(torch.tensor(5.0)))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5.0))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -241,7 +255,7 @@ class FusedLoRALinear(nn.Module):
             # Compute delta = scaling * B @ A
             delta = self.scaling * (self.lora_B @ self.lora_A)
             # Add to base weight
-            self.base_weight.add_(delta.T)
+            self.base_weight.add_(delta)
 
     @classmethod
     def from_linear(
@@ -281,8 +295,49 @@ class FusedLoRALinear(nn.Module):
         return lora_layer
 
 
+def patch_lora_modules(
+    model: nn.Module,
+    *,
+    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    freeze_base: bool = True,
+) -> nn.Module:
+    """
+    Replace matching Linear modules with FusedLoRALinear modules in-place.
+    """
+    replaced_modules: list[str] = []
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if not any(module_name == target or module_name.endswith(f".{target}") for target in target_modules):
+            continue
+
+        parent_path, _, child_name = module_name.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        fused_module = FusedLoRALinear.from_linear(
+            module,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        if freeze_base:
+            fused_module.base_weight.requires_grad_(False)
+            if fused_module.base_bias is not None:
+                fused_module.base_bias.requires_grad_(False)
+        setattr(parent, child_name, fused_module)
+        replaced_modules.append(module_name)
+
+    setattr(model, "_barqtrain_fused_lora_patched", bool(replaced_modules))
+    setattr(model, "_barqtrain_fused_lora_target_modules", tuple(target_modules))
+    setattr(model, "_barqtrain_fused_lora_modules", tuple(replaced_modules))
+    return model
+
+
 __all__ = [
     "FusedLoRAFunction",
     "fused_lora_linear",
     "FusedLoRALinear",
+    "patch_lora_modules",
 ]

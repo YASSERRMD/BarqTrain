@@ -27,12 +27,15 @@ def test_barqtrain_api_exports():
         BarqTrainAdamW,
         create_optimizer,
         dispatch_attention,
+        FusedLoRALinear,
+        fused_lora_linear,
         get_activation_checkpoint_preset,
         materialize_kv_for_attention,
         optimizer_state_bytes,
         pack_for_causal_lm,
         pack_for_padding_free_causal_lm,
         patch_inference,
+        patch_lora_modules,
         patch_llama,
         patch_model,
         patch_qwen,
@@ -50,10 +53,13 @@ def test_barqtrain_api_exports():
     assert callable(apply_activation_checkpointing)
     assert BarqTrainAdamW is not None
     assert callable(dispatch_attention)
+    assert FusedLoRALinear is not None
+    assert callable(fused_lora_linear)
     assert callable(get_activation_checkpoint_preset)
     assert callable(materialize_kv_for_attention)
     assert callable(optimizer_state_bytes)
     assert callable(reset_activation_checkpointing)
+    assert callable(patch_lora_modules)
     assert callable(select_attention_backend)
     assert callable(create_optimizer)
     assert callable(PackedCausalLMDataCollator)
