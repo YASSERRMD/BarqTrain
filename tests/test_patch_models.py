@@ -73,19 +73,25 @@ def test_patch_inference_wraps_generate_without_full_model_patch(monkeypatch):
     model = DummyModel(model_type="qwen2", architectures=["Qwen2ForCausalLM"])
     model.generate = lambda *args, **kwargs: kwargs
 
-    called = {"count": 0}
+    called = {"generate": 0, "forward": 0}
 
     def _patch_generate(m, label):
-        called["count"] += 1
+        called["generate"] += 1
+        return m
+
+    def _patch_forward(m, label):
+        called["forward"] += 1
         return m
 
     monkeypatch.setattr(patch_models, "_patch_generate_with_paged_kv", _patch_generate)
+    monkeypatch.setattr(patch_models, "_patch_causal_lm_chunked_loss", _patch_forward)
     monkeypatch.setattr(patch_models, "_configure_attention_backend", lambda *args, **kwargs: "sdpa")
 
     patched = patch_models.patch_inference(model)
 
     assert patched is model
-    assert called["count"] == 1
+    assert called["forward"] == 1
+    assert called["generate"] == 1
 
 
 def test_patch_causal_lm_chunked_loss_uses_barqtrain_loss(monkeypatch):
@@ -194,6 +200,59 @@ def test_patch_causal_lm_chunked_loss_skips_eval(monkeypatch):
     )
 
     assert model.original_forward_calls == 1
+
+
+def test_patch_causal_lm_last_token_projection_matches_full_logits():
+    class TinyBackbone(torch.nn.Module):
+        def __init__(self, hidden_size):
+            super().__init__()
+            self.embed = torch.nn.Embedding(32, hidden_size)
+
+        def forward(self, input_ids=None, **kwargs):
+            del kwargs
+            hidden = self.embed(input_ids)
+            return SimpleNamespace(
+                last_hidden_state=hidden,
+                past_key_values=("cache",),
+                hidden_states=None,
+                attentions=None,
+            )
+
+    class TinyCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+                use_return_dict=True,
+            )
+            self.model = TinyBackbone(hidden_size=8)
+            self.lm_head = torch.nn.Linear(8, 32, bias=False)
+
+        def forward(self, input_ids=None, labels=None, **kwargs):
+            del labels, kwargs
+            hidden = self.model(input_ids=input_ids).last_hidden_state
+            logits = self.lm_head(hidden)
+            return SimpleNamespace(loss=None, logits=logits)
+
+    reference_model = TinyCausalLM().eval()
+    model = TinyCausalLM().eval()
+    model.load_state_dict(reference_model.state_dict())
+
+    input_ids = torch.randint(0, 32, (2, 4))
+    reference_logits = reference_model(input_ids=input_ids).logits[:, -1:, :]
+
+    patch_models.patch_llama(model)
+    outputs = model(
+        input_ids=input_ids,
+        logits_to_keep=1,
+        use_cache=True,
+    )
+
+    assert outputs.loss is None
+    assert outputs.logits.shape == reference_logits.shape
+    assert torch.allclose(outputs.logits, reference_logits, rtol=1e-5, atol=1e-6)
+    assert getattr(model, "_barqtrain_last_forward_used_last_token_projection", False) is True
 
 
 def test_preferred_attention_backend_prefers_flash_attention(monkeypatch):
