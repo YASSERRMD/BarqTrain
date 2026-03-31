@@ -103,6 +103,12 @@ class PackedTrainingBenchmarkProfile:
     document_masked: bool
 
 
+@dataclass(frozen=True)
+class ActivationCheckpointBenchmarkProfile:
+    name: str
+    num_steps: int
+
+
 def generation_overhead_mb(
     resident_snapshot: CudaMemorySnapshot,
     peak_snapshot: CudaMemorySnapshot,
@@ -645,6 +651,31 @@ def phase5_packed_training_profiles(
     return profiles
 
 
+def phase6_activation_checkpoint_profiles(
+    *,
+    num_steps: int = 3,
+) -> list[ActivationCheckpointBenchmarkProfile]:
+    """
+    Return the required Phase 6 activation-checkpoint benchmark presets.
+    """
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "phase6_activation_checkpoint_profiles"):
+        native_profiles = rust_backend.phase6_activation_checkpoint_profiles(int(num_steps))
+        return [
+            ActivationCheckpointBenchmarkProfile(
+                name=str(profile.name),
+                num_steps=int(profile.num_steps),
+            )
+            for profile in native_profiles
+        ]
+
+    return [
+        ActivationCheckpointBenchmarkProfile(name="max_throughput", num_steps=max(int(num_steps), 1)),
+        ActivationCheckpointBenchmarkProfile(name="balanced", num_steps=max(int(num_steps), 1)),
+        ActivationCheckpointBenchmarkProfile(name="max_memory_saving", num_steps=max(int(num_steps), 1)),
+    ]
+
+
 def _model_forward_parameter_name(
     model: torch.nn.Module,
     candidates: tuple[str, ...],
@@ -756,6 +787,7 @@ __all__ = [
     "KVCacheBenchmarkProfile",
     "ProjectionBenchmarkProfile",
     "PackedTrainingBenchmarkProfile",
+    "ActivationCheckpointBenchmarkProfile",
     "build_generation_kwargs",
     "build_memory_breakdown",
     "capture_cuda_peak_bytes",
@@ -772,6 +804,7 @@ __all__ = [
     "phase3_quantized_kv_profiles",
     "phase4_vocab_projection_profiles",
     "phase5_packed_training_profiles",
+    "phase6_activation_checkpoint_profiles",
     "preferred_last_token_logits_kwarg",
     "record_inference_peak_bytes",
     "record_training_peak_bytes",

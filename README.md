@@ -10,6 +10,7 @@
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
 - **Padding-Free Packed Training Metadata**: Rust emits `cu_seqlens`, block offsets, position IDs, sequence IDs, document IDs, and loss masks for packed batches
+- **Activation Checkpointing Presets**: `max_throughput`, `balanced`, and `max_memory_saving` presets wrap attention/MLP hot paths without changing the public training loop
 - **Native Memory Accounting**: Rust/CUDA benchmark reporting splits resident model memory, KV-cache memory, decode scratch memory, training peak VRAM, and inference peak VRAM
 - **Paged and Quantized KV Cache**: CUDA-backed allocator, page table, gather/scatter path, recycler/free-list management, and quantized older pages with a recent fp residual window
 - **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
@@ -27,6 +28,7 @@ BarqTrain is already a useful native acceleration layer, but it is not yet a ful
 | Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | offloaded cache modes and serving-side compaction accounting |
 | KV cache implementation | Phase 2 shipped | paged allocator, page tables, gather/scatter reads, recycler/free-list management, and contiguous fallback | future compaction/offload |
 | Quantized KV cache | Phase 3 shipped | older pages stored in int8 with a recent fp residual window plus quality/memory tradeoff reporting | compaction/offload and deeper attention fusion |
+| Activation memory control | Phase 6 shipped | checkpoint presets for attention/MLP hot paths plus stability/VRAM benchmark reporting | native optimizer-state control |
 | Optimizer memory | wrapper-level | optional training-memory savings | native optimizer-state control |
 
 ## Research-Backed Roadmap
@@ -256,6 +258,7 @@ BarqTrain exposes thin helpers for the optimized training path:
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
 - `PaddingFreeCausalLMDataCollator(...)`: emits packed blocks plus `cu_seqlens`, block offsets, document IDs, and loss masks for padding-free training experiments
 - `pack_for_padding_free_causal_lm(...)`: direct Rust-backed packing helper for jagged metadata emission
+- `apply_activation_checkpointing(model, preset=...)`: wraps compatible attention/MLP modules with explicit `max_throughput`, `balanced`, or `max_memory_saving` presets
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
 - `create_kv_cache(...)`: explicitly create a contiguous, paged, or paged-quantized KV cache
 - `create_contiguous_kv_cache(...)`: explicitly create the contiguous fallback cache
@@ -360,6 +363,7 @@ BarqTrain should be evaluated in two separate ways:
 - **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
 - **Inference path**: Phase 1 reports memory buckets separately, Phase 2 compares paged versus contiguous KV-cache behavior, Phase 3 extends that to quantized older pages with explicit quality/memory tradeoffs, and Phase 4 measures fused LM-head projection/loss versus the full-logits fallback.
 - **Packed training path**: Phase 5 compares padded versus packed training at matched effective-token counts and tracks the document-masked packed mode separately.
+- **Activation-memory path**: Phase 6 compares checkpoint presets on the same training state and reports VRAM, tokens/sec, step time, and loss-curve stability.
 
 Shipped benchmark reporting now includes these memory buckets explicitly:
 
@@ -445,12 +449,29 @@ Each Phase 5 packed training report entry records:
 7. `loss_delta_vs_padded`
 8. the same bucketed `memory` breakdown used by earlier suites
 
+The shipped Phase 6 activation-checkpoint benchmark suite compares these presets:
+
+1. `max_throughput`
+2. `balanced`
+3. `max_memory_saving`
+
+Each Phase 6 checkpoint report entry records:
+
+1. `preset_name`
+2. `total_steps`
+3. `total_tokens`
+4. `tokens_per_second`
+5. `avg_step_time_seconds`
+6. `peak_vram_mb`
+7. `loss_stddev`
+8. `loss_delta_vs_max_throughput`
+9. the same bucketed `memory` breakdown used by earlier suites
+
 The remaining roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
-1. activation-memory control
-2. native optimizer-state control
-3. deeper block fusion and decode-heavy attention fusion
-4. future cache compaction/offload
+1. native optimizer-state control
+2. deeper block fusion and decode-heavy attention fusion
+3. future cache compaction/offload
 
 Example Phase 1 report shape:
 
@@ -579,6 +600,33 @@ Example Phase 5 report shape:
       "throughput_at_matched_effective_tokens": 0.0,
       "peak_vram_mb": 0.0,
       "loss_delta_vs_padded": 0.0,
+      "memory": {
+        "resident_model_mb": 0.0,
+        "kv_cache_mb": 0.0,
+        "temporary_decode_buffers_mb": 0.0,
+        "training_peak_vram_mb": 0.0,
+        "inference_peak_vram_mb": 0.0
+      }
+    }
+  ]
+}
+```
+
+Example Phase 6 report shape:
+
+```json
+{
+  "benchmark_suite": "phase6",
+  "checkpoint_profiles": [
+    {
+      "preset_name": "balanced",
+      "total_steps": 3,
+      "total_tokens": 0,
+      "tokens_per_second": 0.0,
+      "avg_step_time_seconds": 0.0,
+      "peak_vram_mb": 0.0,
+      "loss_stddev": 0.0,
+      "loss_delta_vs_max_throughput": 0.0,
       "memory": {
         "resident_model_mb": 0.0,
         "kv_cache_mb": 0.0,

@@ -22,13 +22,16 @@ def test_barqtrain_api_exports():
     from barqtrain import (
         PackedCausalLMDataCollator,
         PaddingFreeCausalLMDataCollator,
+        apply_activation_checkpointing,
         create_optimizer,
+        get_activation_checkpoint_preset,
         pack_for_causal_lm,
         pack_for_padding_free_causal_lm,
         patch_inference,
         patch_llama,
         patch_model,
         patch_qwen,
+        reset_activation_checkpointing,
     )
 
     assert callable(patch_model)
@@ -37,6 +40,9 @@ def test_barqtrain_api_exports():
     assert callable(patch_qwen)
     assert callable(pack_for_causal_lm)
     assert callable(pack_for_padding_free_causal_lm)
+    assert callable(apply_activation_checkpointing)
+    assert callable(get_activation_checkpoint_preset)
+    assert callable(reset_activation_checkpointing)
     assert callable(create_optimizer)
     assert callable(PackedCausalLMDataCollator)
     assert callable(PaddingFreeCausalLMDataCollator)

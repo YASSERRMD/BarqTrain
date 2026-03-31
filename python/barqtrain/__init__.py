@@ -59,6 +59,12 @@ from barqtrain.kv_cache import (
     create_paged_kv_cache,
     create_quantized_paged_kv_cache,
 )
+from barqtrain.checkpointing import (
+    activation_checkpoint_presets,
+    apply_activation_checkpointing,
+    get_activation_checkpoint_preset,
+    reset_activation_checkpointing,
+)
 from barqtrain.optim import create_optimizer
 
 __all__ = [
@@ -90,6 +96,10 @@ __all__ = [
     "create_kv_cache",
     "create_paged_kv_cache",
     "create_quantized_paged_kv_cache",
+    "activation_checkpoint_presets",
+    "apply_activation_checkpointing",
+    "get_activation_checkpoint_preset",
+    "reset_activation_checkpointing",
     "create_optimizer",
     "__version__",
 ]

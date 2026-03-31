@@ -8,9 +8,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
+import statistics
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -38,8 +40,13 @@ from barqtrain.memory import (
     phase3_quantized_kv_profiles,
     phase4_vocab_projection_profiles,
     phase5_packed_training_profiles,
+    phase6_activation_checkpoint_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
+)
+from barqtrain.checkpointing import (
+    apply_activation_checkpointing,
+    reset_activation_checkpointing,
 )
 from barqtrain.ops import (
     chunked_cross_entropy_loss,
@@ -175,6 +182,21 @@ class PackedTrainingBenchmarkMetrics:
 
 
 @dataclass
+class ActivationCheckpointBenchmarkMetrics:
+    """Benchmark metrics for Phase 6 activation-checkpoint presets."""
+
+    preset_name: str
+    total_steps: int
+    total_tokens: int
+    tokens_per_second: float
+    avg_step_time_seconds: float
+    peak_vram_mb: float
+    loss_stddev: float
+    loss_delta_vs_max_throughput: float
+    memory: BenchmarkMemoryBreakdown = field(default_factory=BenchmarkMemoryBreakdown)
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -188,6 +210,7 @@ class BenchmarkReport:
     quantized_kv_profiles: list[QuantizedKVBenchmarkMetrics] = field(default_factory=list)
     projection_profiles: list[ProjectionBenchmarkMetrics] = field(default_factory=list)
     packed_training_profiles: list[PackedTrainingBenchmarkMetrics] = field(default_factory=list)
+    checkpoint_profiles: list[ActivationCheckpointBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -1161,6 +1184,131 @@ class BenchmarkHarness:
             packed_training_profiles=self.run_phase5_packed_training_benchmarks(),
         )
 
+    def run_phase6_activation_checkpoint_benchmarks(self) -> list[ActivationCheckpointBenchmarkMetrics]:
+        """Run the Phase 6 activation-checkpoint preset benchmark suite."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 6 Activation Checkpoint Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Detailed Profiling: {self.detailed_profiling}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        set_detailed_profiling_enabled(self.detailed_profiling)
+        self.setup_model_and_tokenizer()
+        if hasattr(self.model, "model") and hasattr(self.model, "lm_head"):
+            self.model = patch_model(self.model)
+        dataloader = self.prepare_dataset()
+        profiles = phase6_activation_checkpoint_profiles(num_steps=min(self.num_steps, 3) or 1)
+        base_state = copy.deepcopy(self.model.state_dict())
+
+        metrics: list[ActivationCheckpointBenchmarkMetrics] = []
+        baselines: dict[str, dict[str, float | int]] = {}
+
+        for profile in profiles:
+            self.model.load_state_dict(base_state)
+            reset_activation_checkpointing(self.model)
+            apply_activation_checkpointing(self.model, preset=profile.name)
+            self.model.train()
+            optimizer = create_optimizer(
+                self.model.parameters(),
+                lr=1e-5,
+                optimizer_name=self.optimizer_name,
+            )
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            resident_model_bytes = model_resident_cuda_bytes(self.model)
+            total_tokens = 0
+            losses = []
+            total_time = 0.0
+
+            data_iter = iter(dataloader)
+            for _ in range(profile.num_steps):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
+
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch.get("labels")
+                labels = input_ids if labels is None else labels.to(self.device)
+
+                self.model.zero_grad(set_to_none=True)
+                self._sync_device()
+                start_time = time.time()
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = outputs.loss
+                if loss is None:
+                    raise RuntimeError("phase6 benchmark expected a training loss")
+                loss.backward()
+                optimizer.step()
+                self._sync_device()
+                total_time += time.time() - start_time
+
+                loss_value = float(loss.detach().float().item())
+                losses.append(loss_value)
+                total_tokens += int(labels.ne(-100).sum().item())
+
+            training_peak_bytes = capture_cuda_peak_bytes()
+            record_training_peak_bytes(training_peak_bytes)
+            memory = build_memory_breakdown(
+                resident_model_bytes=resident_model_bytes,
+                kv_cache_bytes=0,
+                temporary_decode_buffer_bytes=0,
+                training_peak_bytes=training_peak_bytes,
+                inference_peak_bytes=0,
+                detailed_profiling=self.detailed_profiling,
+            )
+            baseline = baselines.get("max_throughput")
+            if baseline is None:
+                baseline = {
+                    "loss_mean": float(sum(losses) / max(len(losses), 1)),
+                }
+                baselines["max_throughput"] = baseline
+
+            metric = ActivationCheckpointBenchmarkMetrics(
+                preset_name=profile.name,
+                total_steps=profile.num_steps,
+                total_tokens=total_tokens,
+                tokens_per_second=total_tokens / max(total_time, 1e-9),
+                avg_step_time_seconds=total_time / max(profile.num_steps, 1),
+                peak_vram_mb=memory.training_peak_vram_mb,
+                loss_stddev=statistics.pstdev(losses) if len(losses) > 1 else 0.0,
+                loss_delta_vs_max_throughput=(
+                    float(sum(losses) / max(len(losses), 1)) - float(baseline["loss_mean"])
+                ),
+                memory=memory,
+            )
+            metrics.append(metric)
+
+            print(
+                f"{metric.preset_name} | steps={metric.total_steps} | "
+                f"tok/s={metric.tokens_per_second:.1f} | "
+                f"step={metric.avg_step_time_seconds:.4f}s | "
+                f"peak={metric.peak_vram_mb:.1f} MB | "
+                f"loss_std={metric.loss_stddev:.6f}"
+            )
+
+        reset_activation_checkpointing(self.model)
+        self.model.load_state_dict(base_state)
+        return metrics
+
+    def run_phase6_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 6 activation-checkpoint benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase6",
+            checkpoint_profiles=self.run_phase6_activation_checkpoint_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -1347,6 +1495,8 @@ class BenchmarkHarness:
                 filename = "phase4_results.json"
             elif results.benchmark_suite == "phase5":
                 filename = "phase5_results.json"
+            elif results.benchmark_suite == "phase6":
+                filename = "phase6_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -1436,6 +1586,17 @@ class BenchmarkHarness:
                     f"{best_profile.peak_vram_mb:.1f} MB / "
                     f"{best_profile.loss_delta_vs_padded:.6f}"
                 )
+            if results.checkpoint_profiles:
+                best_profile = min(results.checkpoint_profiles, key=lambda metric: metric.avg_step_time_seconds)
+                print(
+                    f"Fastest Checkpoint Preset: {best_profile.preset_name} "
+                    f"({best_profile.tokens_per_second:.1f} tok/s)"
+                )
+                print(
+                    f"Checkpoint Peak/Loss Std: "
+                    f"{best_profile.peak_vram_mb:.1f} MB / "
+                    f"{best_profile.loss_stddev:.6f}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -1474,7 +1635,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3", "phase4", "phase5"],
+        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -1579,6 +1740,8 @@ def main() -> None:
         results = harness.run_phase4_benchmarks()
     elif args.suite == "phase5":
         results = harness.run_phase5_benchmarks()
+    elif args.suite == "phase6":
+        results = harness.run_phase6_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:
