@@ -72,6 +72,66 @@ impl PackedCausalLMBatch {
     }
 }
 
+/// Packed causal LM block with jagged metadata for padding-free training.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct PackedPaddingFreeBatch {
+    #[pyo3(get, set)]
+    pub input_ids: Vec<u32>,
+    #[pyo3(get, set)]
+    pub attention_mask: Vec<u8>,
+    #[pyo3(get, set)]
+    pub labels: Vec<i64>,
+    #[pyo3(get, set)]
+    pub position_ids: Vec<u64>,
+    #[pyo3(get, set)]
+    pub sequence_ids: Vec<i64>,
+    #[pyo3(get, set)]
+    pub document_ids: Vec<i64>,
+    #[pyo3(get, set)]
+    pub loss_mask: Vec<u8>,
+    #[pyo3(get, set)]
+    pub cu_seqlens: Vec<u32>,
+    #[pyo3(get, set)]
+    pub block_offsets: Vec<u32>,
+    #[pyo3(get, set)]
+    pub max_sequence_length: usize,
+    #[pyo3(get, set)]
+    pub active_tokens: usize,
+}
+
+#[pymethods]
+impl PackedPaddingFreeBatch {
+    #[new]
+    fn new(
+        input_ids: Vec<u32>,
+        attention_mask: Vec<u8>,
+        labels: Vec<i64>,
+        position_ids: Vec<u64>,
+        sequence_ids: Vec<i64>,
+        document_ids: Vec<i64>,
+        loss_mask: Vec<u8>,
+        cu_seqlens: Vec<u32>,
+        block_offsets: Vec<u32>,
+        max_sequence_length: usize,
+        active_tokens: usize,
+    ) -> Self {
+        Self {
+            input_ids,
+            attention_mask,
+            labels,
+            position_ids,
+            sequence_ids,
+            document_ids,
+            loss_mask,
+            cu_seqlens,
+            block_offsets,
+            max_sequence_length,
+            active_tokens,
+        }
+    }
+}
+
 /// Native memory breakdown emitted by the Rust benchmark/reporting helpers.
 #[pyclass]
 #[derive(Clone, Debug)]
@@ -211,6 +271,38 @@ impl ProjectionBenchmarkProfile {
             sequence_length,
             prompt_length,
             decode_length,
+        }
+    }
+}
+
+/// Canonical Phase 5 packed training benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct PackedTrainingBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub sequence_length: usize,
+    #[pyo3(get)]
+    pub document_masked: bool,
+}
+
+#[pymethods]
+impl PackedTrainingBenchmarkProfile {
+    #[new]
+    fn new(
+        name: String,
+        batch_size: usize,
+        sequence_length: usize,
+        document_masked: bool,
+    ) -> Self {
+        Self {
+            name,
+            batch_size,
+            sequence_length,
+            document_masked,
         }
     }
 }
@@ -472,6 +564,34 @@ fn phase4_vocab_projection_profiles(
     profiles
 }
 
+/// Emit the required Phase 5 packed training benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    sequence_length=512
+))]
+fn phase5_packed_training_profiles(
+    batch_sizes: Vec<usize>,
+    sequence_length: usize,
+) -> Vec<PackedTrainingBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 2);
+    for batch_size in batch_sizes {
+        profiles.push(PackedTrainingBenchmarkProfile {
+            name: "matched_effective_tokens".to_string(),
+            batch_size,
+            sequence_length,
+            document_masked: false,
+        });
+        profiles.push(PackedTrainingBenchmarkProfile {
+            name: "document_masked_training".to_string(),
+            batch_size,
+            sequence_length,
+            document_masked: true,
+        });
+    }
+    profiles
+}
+
 /// Pack sequences efficiently using bin-packing algorithm
 ///
 /// This implements a first-fit decreasing algorithm for efficient
@@ -591,6 +711,90 @@ fn flush_causal_lm_batch(
     });
 }
 
+fn flush_padding_free_batch(
+    packed_batches: &mut Vec<PackedPaddingFreeBatch>,
+    current_tokens: &mut Vec<u32>,
+    current_position_ids: &mut Vec<u64>,
+    current_sequence_ids: &mut Vec<i64>,
+    current_document_ids: &mut Vec<i64>,
+    current_segment_lengths: &mut Vec<usize>,
+    current_boundary_starts: &mut Vec<usize>,
+    max_length: usize,
+    pad_token_id: u32,
+    label_pad_token_id: i64,
+    drop_remainder: bool,
+) {
+    if current_tokens.is_empty() {
+        return;
+    }
+
+    let seq_len = current_tokens.len();
+    if drop_remainder && seq_len < max_length {
+        *current_tokens = Vec::with_capacity(max_length);
+        *current_position_ids = Vec::with_capacity(max_length);
+        *current_sequence_ids = Vec::with_capacity(max_length);
+        *current_document_ids = Vec::with_capacity(max_length);
+        current_segment_lengths.clear();
+        current_boundary_starts.clear();
+        return;
+    }
+
+    let mut input_ids = std::mem::replace(current_tokens, Vec::with_capacity(max_length));
+    let mut position_ids = std::mem::replace(current_position_ids, Vec::with_capacity(max_length));
+    let mut sequence_ids = std::mem::replace(current_sequence_ids, Vec::with_capacity(max_length));
+    let mut document_ids = std::mem::replace(current_document_ids, Vec::with_capacity(max_length));
+    let segment_lengths = std::mem::take(current_segment_lengths);
+    let boundary_starts = std::mem::take(current_boundary_starts);
+
+    let mut attention_mask = vec![1u8; seq_len];
+    let mut labels: Vec<i64> = input_ids.iter().map(|token| *token as i64).collect();
+    for boundary_start in boundary_starts {
+        if boundary_start < labels.len() {
+            labels[boundary_start] = label_pad_token_id;
+        }
+    }
+    let mut loss_mask: Vec<u8> = labels
+        .iter()
+        .map(|label| if *label == label_pad_token_id { 0 } else { 1 })
+        .collect();
+
+    let mut cu_seqlens = Vec::with_capacity(segment_lengths.len() + 1);
+    cu_seqlens.push(0);
+    let mut block_offsets = Vec::with_capacity(segment_lengths.len());
+    let mut running = 0usize;
+    let mut max_sequence_length = 0usize;
+    for segment_length in segment_lengths {
+        block_offsets.push(running as u32);
+        running = running.saturating_add(segment_length);
+        cu_seqlens.push(running as u32);
+        max_sequence_length = max_sequence_length.max(segment_length);
+    }
+
+    if seq_len < max_length {
+        input_ids.resize(max_length, pad_token_id);
+        attention_mask.resize(max_length, 0);
+        labels.resize(max_length, label_pad_token_id);
+        position_ids.resize(max_length, 0);
+        sequence_ids.resize(max_length, -1);
+        document_ids.resize(max_length, -1);
+        loss_mask.resize(max_length, 0);
+    }
+
+    packed_batches.push(PackedPaddingFreeBatch {
+        input_ids,
+        attention_mask,
+        labels,
+        position_ids,
+        sequence_ids,
+        document_ids,
+        loss_mask,
+        cu_seqlens,
+        block_offsets,
+        max_sequence_length,
+        active_tokens: seq_len,
+    });
+}
+
 /// Pack tokenized sequences into fixed-length causal LM blocks.
 ///
 /// Each input sequence is concatenated with an EOS separator when needed,
@@ -660,6 +864,143 @@ fn pack_for_causal_lm(
     flush_causal_lm_batch(
         &mut packed_batches,
         &mut current_tokens,
+        max_length,
+        pad_token_id,
+        label_pad_token_id,
+        drop_remainder,
+    );
+
+    Ok(packed_batches)
+}
+
+/// Pack tokenized sequences into fixed-length causal LM blocks with jagged metadata.
+#[pyfunction]
+#[pyo3(signature = (
+    sequences,
+    max_length,
+    pad_token_id,
+    eos_token_id=None,
+    label_pad_token_id=-100,
+    drop_remainder=false,
+    document_ids=None,
+    document_masked=false
+))]
+fn pack_for_padding_free_causal_lm(
+    sequences: Vec<Vec<u32>>,
+    max_length: usize,
+    pad_token_id: u32,
+    eos_token_id: Option<u32>,
+    label_pad_token_id: i64,
+    drop_remainder: bool,
+    document_ids: Option<Vec<i64>>,
+    document_masked: bool,
+) -> PyResult<Vec<PackedPaddingFreeBatch>> {
+    if max_length == 0 {
+        return Err(PyValueError::new_err("max_length must be > 0"));
+    }
+
+    if let Some(ref provided_document_ids) = document_ids {
+        if provided_document_ids.len() != sequences.len() {
+            return Err(PyValueError::new_err(
+                "document_ids must match the number of sequences",
+            ));
+        }
+    }
+
+    let eos_token_id = eos_token_id.unwrap_or(pad_token_id);
+    let mut prepared_sequences: Vec<(usize, i64, Vec<u32>)> = Vec::new();
+    for (index, mut sequence) in sequences.into_iter().enumerate() {
+        if sequence.is_empty() {
+            continue;
+        }
+        if sequence.last().copied() != Some(eos_token_id) {
+            sequence.push(eos_token_id);
+        }
+        let document_id = document_ids
+            .as_ref()
+            .and_then(|ids| ids.get(index).copied())
+            .unwrap_or(index as i64);
+        prepared_sequences.push((index, document_id, sequence));
+    }
+
+    let total_tokens: usize = prepared_sequences.iter().map(|(_, _, sequence)| sequence.len()).sum();
+    let estimated_batches = if drop_remainder {
+        total_tokens / max_length
+    } else {
+        (total_tokens + max_length.saturating_sub(1)) / max_length
+    };
+
+    let mut packed_batches: Vec<PackedPaddingFreeBatch> =
+        Vec::with_capacity(estimated_batches.max(1));
+    let mut current_tokens: Vec<u32> = Vec::with_capacity(max_length);
+    let mut current_position_ids: Vec<u64> = Vec::with_capacity(max_length);
+    let mut current_sequence_ids: Vec<i64> = Vec::with_capacity(max_length);
+    let mut current_document_ids: Vec<i64> = Vec::with_capacity(max_length);
+    let mut current_segment_lengths: Vec<usize> = Vec::new();
+    let mut current_boundary_starts: Vec<usize> = Vec::new();
+
+    for (sequence_index, document_id, sequence) in prepared_sequences {
+        let mut cursor = 0usize;
+        while cursor < sequence.len() {
+            if current_tokens.len() == max_length {
+                flush_padding_free_batch(
+                    &mut packed_batches,
+                    &mut current_tokens,
+                    &mut current_position_ids,
+                    &mut current_sequence_ids,
+                    &mut current_document_ids,
+                    &mut current_segment_lengths,
+                    &mut current_boundary_starts,
+                    max_length,
+                    pad_token_id,
+                    label_pad_token_id,
+                    drop_remainder,
+                );
+            }
+
+            let available = max_length - current_tokens.len();
+            let next_cursor = (cursor + available).min(sequence.len());
+            let chunk = &sequence[cursor..next_cursor];
+            let segment_start = current_tokens.len();
+            if document_masked && cursor == 0 && segment_start > 0 {
+                current_boundary_starts.push(segment_start);
+            }
+            current_segment_lengths.push(chunk.len());
+
+            for (offset, token) in chunk.iter().enumerate() {
+                current_tokens.push(*token);
+                current_position_ids.push((cursor + offset) as u64);
+                current_sequence_ids.push(sequence_index as i64);
+                current_document_ids.push(document_id);
+            }
+            cursor = next_cursor;
+
+            if current_tokens.len() == max_length {
+                flush_padding_free_batch(
+                    &mut packed_batches,
+                    &mut current_tokens,
+                    &mut current_position_ids,
+                    &mut current_sequence_ids,
+                    &mut current_document_ids,
+                    &mut current_segment_lengths,
+                    &mut current_boundary_starts,
+                    max_length,
+                    pad_token_id,
+                    label_pad_token_id,
+                    drop_remainder,
+                );
+            }
+        }
+    }
+
+    flush_padding_free_batch(
+        &mut packed_batches,
+        &mut current_tokens,
+        &mut current_position_ids,
+        &mut current_sequence_ids,
+        &mut current_document_ids,
+        &mut current_segment_lengths,
+        &mut current_boundary_starts,
         max_length,
         pad_token_id,
         label_pad_token_id,
@@ -742,13 +1083,16 @@ fn create_prefetch_queue(batches: Vec<PackedBatch>) -> PrefetchQueue {
 fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PackedBatch>()?;
     m.add_class::<PackedCausalLMBatch>()?;
+    m.add_class::<PackedPaddingFreeBatch>()?;
     m.add_class::<MemoryBreakdown>()?;
     m.add_class::<DecodeBenchmarkProfile>()?;
     m.add_class::<KVCacheBenchmarkProfile>()?;
     m.add_class::<ProjectionBenchmarkProfile>()?;
+    m.add_class::<PackedTrainingBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_for_padding_free_causal_lm, m)?)?;
     m.add_function(wrap_pyfunction!(parallel_tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(create_prefetch_queue, m)?)?;
     m.add_function(wrap_pyfunction!(model_cuda_bytes, m)?)?;
@@ -757,5 +1101,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase2_kv_cache_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_quantized_kv_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase4_vocab_projection_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase5_packed_training_profiles, m)?)?;
     Ok(())
 }

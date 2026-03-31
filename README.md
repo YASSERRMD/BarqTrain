@@ -9,6 +9,7 @@
 - **FlashAttention Integration**: `patch_model(...)` selects `flash_attention_2` when available and falls back to PyTorch SDPA otherwise
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
+- **Padding-Free Packed Training Metadata**: Rust emits `cu_seqlens`, block offsets, position IDs, sequence IDs, document IDs, and loss masks for packed batches
 - **Native Memory Accounting**: Rust/CUDA benchmark reporting splits resident model memory, KV-cache memory, decode scratch memory, training peak VRAM, and inference peak VRAM
 - **Paged and Quantized KV Cache**: CUDA-backed allocator, page table, gather/scatter path, recycler/free-list management, and quantized older pages with a recent fp residual window
 - **Paged Optimizer Support**: Switch between `AdamW`, `PagedAdamW32bit`, and `PagedAdamW8bit`
@@ -21,7 +22,7 @@ BarqTrain is already a useful native acceleration layer, but it is not yet a ful
 |------|---------------|---------------|--------------|
 | RMSNorm | CUDA kernel shipped | lower kernel overhead | deeper fusion into larger blocks |
 | Cross-entropy and decode projection | Phase 4 shipped | fused LM-head projection/loss path plus last-token decode specialization | deeper vocab/head fusion across more model families |
-| Data path | Rust packing shipped | lower Python overhead and less padding waste | padding-free end-to-end training path |
+| Data path | Phase 5 shipped | Rust packing plus padding-free training metadata, masked packed-loss consumption, and padded fallback benchmarking | activation-memory control presets and broader model patching |
 | Attention | backend selection shipped | faster attention when FlashAttention is available | deeper native attention fusion |
 | Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | offloaded cache modes and serving-side compaction accounting |
 | KV cache implementation | Phase 2 shipped | paged allocator, page tables, gather/scatter reads, recycler/free-list management, and contiguous fallback | future compaction/offload |
@@ -253,6 +254,8 @@ BarqTrain exposes thin helpers for the optimized training path:
 - `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through the fused LM-head projection/loss path, and wraps compatible CUDA generation calls to inject BarqTrain's native KV cache automatically (`paged`, `contiguous`, `paged_quantized`, or `auto`)
 - `patch_inference(model)`: inference-only patching path for decode benchmarks and low-memory generation experiments
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
+- `PaddingFreeCausalLMDataCollator(...)`: emits packed blocks plus `cu_seqlens`, block offsets, document IDs, and loss masks for padding-free training experiments
+- `pack_for_padding_free_causal_lm(...)`: direct Rust-backed packing helper for jagged metadata emission
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
 - `create_kv_cache(...)`: explicitly create a contiguous, paged, or paged-quantized KV cache
 - `create_contiguous_kv_cache(...)`: explicitly create the contiguous fallback cache
@@ -356,6 +359,7 @@ BarqTrain should be evaluated in two separate ways:
 
 - **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
 - **Inference path**: Phase 1 reports memory buckets separately, Phase 2 compares paged versus contiguous KV-cache behavior, Phase 3 extends that to quantized older pages with explicit quality/memory tradeoffs, and Phase 4 measures fused LM-head projection/loss versus the full-logits fallback.
+- **Packed training path**: Phase 5 compares padded versus packed training at matched effective-token counts and tracks the document-masked packed mode separately.
 
 Shipped benchmark reporting now includes these memory buckets explicitly:
 
@@ -425,13 +429,28 @@ Each Phase 4 projection report entry records:
 8. `last_token_logits_only`
 9. the same bucketed `memory` breakdown used by earlier suites
 
+The shipped Phase 5 packed training benchmark suite compares `padded` and `packed` execution on:
+
+1. `matched_effective_tokens`
+2. `document_masked_training`
+
+Each Phase 5 packed training report entry records:
+
+1. `packing_mode`
+2. `effective_tokens`
+3. `step_time_seconds`
+4. `effective_tokens_per_second`
+5. `throughput_at_matched_effective_tokens`
+6. `peak_vram_mb`
+7. `loss_delta_vs_padded`
+8. the same bucketed `memory` breakdown used by earlier suites
+
 The remaining roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
-1. padding-free packed training
-2. activation-memory control
-3. native optimizer-state control
-4. deeper block fusion and decode-heavy attention fusion
-5. future cache compaction/offload
+1. activation-memory control
+2. native optimizer-state control
+3. deeper block fusion and decode-heavy attention fusion
+4. future cache compaction/offload
 
 Example Phase 1 report shape:
 
@@ -533,6 +552,33 @@ Example Phase 4 report shape:
       "loss_delta_vs_baseline": 0.0,
       "generation_match_ratio": 1.0,
       "last_token_logits_only": true,
+      "memory": {
+        "resident_model_mb": 0.0,
+        "kv_cache_mb": 0.0,
+        "temporary_decode_buffers_mb": 0.0,
+        "training_peak_vram_mb": 0.0,
+        "inference_peak_vram_mb": 0.0
+      }
+    }
+  ]
+}
+```
+
+Example Phase 5 report shape:
+
+```json
+{
+  "benchmark_suite": "phase5",
+  "packed_training_profiles": [
+    {
+      "scenario_name": "matched_effective_tokens",
+      "packing_mode": "packed",
+      "effective_tokens": 0,
+      "step_time_seconds": 0.0,
+      "effective_tokens_per_second": 0.0,
+      "throughput_at_matched_effective_tokens": 0.0,
+      "peak_vram_mb": 0.0,
+      "loss_delta_vs_padded": 0.0,
       "memory": {
         "resident_model_mb": 0.0,
         "kv_cache_mb": 0.0,

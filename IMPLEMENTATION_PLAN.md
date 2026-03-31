@@ -6,8 +6,8 @@ This plan turns the project into a native memory-and-throughput stack in phased,
 
 Status update:
 
-- Phases 1 through 4 are now shipped in BarqTrain.
-- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 5.
+- Phases 1 through 5 are now shipped in BarqTrain.
+- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 6.
 
 ## Objective
 
@@ -24,12 +24,12 @@ What BarqTrain already does in native code:
 - CUDA fused RMSNorm
 - CUDA chunked cross-entropy plus fused LM-head projection/loss routing for compatible decoder-only training
 - Rust sequence packing for the causal-LM data path
+- Rust-emitted jagged metadata and padding-free training helpers for packed batches
 - native memory accounting with resident/KV/decode/training/inference buckets
 - CUDA paged and quantized KV-cache paths with runtime selection and reporting
 
 What is still missing for the remaining roadmap:
 
-- native padding-free attention path for packed training batches
 - activation-memory control presets around attention/MLP hot paths
 - native optimizer-state layouts for BarqTrain-managed training loops
 - deeper block fusion and decode-heavy attention fusion

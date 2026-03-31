@@ -15,6 +15,7 @@ class FakeRustBackend:
         self.pack_sequences_calls = []
         self.parallel_tokenize_calls = []
         self.pack_for_causal_lm_calls = []
+        self.pack_for_padding_free_causal_lm_calls = []
 
     def pack_sequences(self, sequences, max_len):
         self.pack_sequences_calls.append((sequences, max_len))
@@ -61,6 +62,45 @@ class FakeRustBackend:
                 attention_mask=[1, 1, 0, 0, 0],
                 labels=[5, 99, -100, -100, -100],
             ),
+        ]
+
+    def pack_for_padding_free_causal_lm(
+        self,
+        sequences,
+        max_length,
+        pad_token_id,
+        eos_token_id,
+        label_pad_token_id,
+        drop_remainder,
+        document_ids,
+        document_masked,
+    ):
+        self.pack_for_padding_free_causal_lm_calls.append(
+            (
+                sequences,
+                max_length,
+                pad_token_id,
+                eos_token_id,
+                label_pad_token_id,
+                drop_remainder,
+                document_ids,
+                document_masked,
+            )
+        )
+        return [
+            SimpleNamespace(
+                input_ids=[1, 2, 3, 99, 4],
+                attention_mask=[1, 1, 1, 1, 1],
+                labels=[1, -100, 3, 99, 4],
+                position_ids=[0, 1, 2, 0, 1],
+                sequence_ids=[0, 0, 0, 1, 1],
+                document_ids=[10, 10, 10, 11, 11],
+                loss_mask=[1, 0, 1, 1, 1],
+                cu_seqlens=[0, 3, 5],
+                block_offsets=[0, 3],
+                max_sequence_length=3,
+                active_tokens=5,
+            )
         ]
 
 
@@ -179,3 +219,82 @@ def test_packed_causal_lm_collator_uses_trimmed_sequences(monkeypatch):
     assert batch["input_ids"].tolist() == [[1, 2, 3, 99, 4], [5, 99, 0, 0, 0]]
     assert batch["attention_mask"].tolist() == [[1, 1, 1, 1, 1], [1, 1, 0, 0, 0]]
     assert batch["labels"].tolist() == [[1, 2, 3, 99, 4], [5, 99, -100, -100, -100]]
+
+
+def test_pack_for_padding_free_causal_lm_requires_native_method(monkeypatch):
+    monkeypatch.setattr(data, "_get_rust_backend", lambda: object())
+
+    with pytest.raises(RuntimeError, match="missing `pack_for_padding_free_causal_lm`"):
+        data.pack_for_padding_free_causal_lm(
+            sequences=[[1, 2, 3]],
+            max_length=4,
+            pad_token_id=0,
+        )
+
+
+def test_pack_for_padding_free_causal_lm_uses_rust_backend(monkeypatch):
+    backend = FakeRustBackend()
+    monkeypatch.setattr(data, "_get_rust_backend", lambda: backend)
+
+    packed = data.pack_for_padding_free_causal_lm(
+        sequences=[[1, 2, 3], [4, 5]],
+        max_length=5,
+        pad_token_id=0,
+        eos_token_id=99,
+        document_ids=[10, 11],
+        document_masked=True,
+    )
+
+    assert backend.pack_for_padding_free_causal_lm_calls == [
+        (
+            [[1, 2, 3], [4, 5]],
+            5,
+            0,
+            99,
+            -100,
+            False,
+            [10, 11],
+            True,
+        )
+    ]
+    assert packed[0]["position_ids"] == [0, 1, 2, 0, 1]
+    assert packed[0]["document_ids"] == [10, 10, 10, 11, 11]
+    assert packed[0]["cu_seqlens"] == [0, 3, 5]
+    assert packed[0]["active_tokens"] == 5
+
+
+def test_padding_free_collator_returns_metadata_tensors(monkeypatch):
+    backend = FakeRustBackend()
+    monkeypatch.setattr(data, "_get_rust_backend", lambda: backend)
+
+    collator = data.PaddingFreeCausalLMDataCollator(
+        max_length=5,
+        pad_token_id=0,
+        eos_token_id=2,
+        document_masked=True,
+    )
+    batch = collator(
+        [
+            {"input_ids": [11, 12, 0, 0], "attention_mask": [1, 1, 0, 0], "document_id": 10},
+            {"input_ids": [21, 0, 0, 0], "attention_mask": [1, 0, 0, 0], "document_id": 11},
+        ]
+    )
+
+    assert backend.pack_for_padding_free_causal_lm_calls == [
+        (
+            [[11, 12], [21]],
+            5,
+            0,
+            2,
+            -100,
+            False,
+            [10, 11],
+            True,
+        )
+    ]
+    assert batch["position_ids"].tolist() == [[0, 1, 2, 0, 1]]
+    assert batch["sequence_ids"].tolist() == [[0, 0, 0, 1, 1]]
+    assert batch["document_ids"].tolist() == [[10, 10, 10, 11, 11]]
+    assert batch["loss_mask"].tolist() == [[1, 0, 1, 1, 1]]
+    assert batch["cu_seqlens"].tolist() == [[0, 3, 5]]
+    assert batch["block_offsets"].tolist() == [[0, 3]]
