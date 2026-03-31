@@ -336,6 +336,8 @@ def test_configure_attention_backend_updates_model_config(monkeypatch):
     assert backend == "flash_attention_2"
     assert model.config._attn_implementation == "flash_attention_2"
     assert model.config.attn_implementation == "flash_attention_2"
+    assert "barqtrain_native_decode" in model._barqtrain_supported_attention_backends
+    assert "sdpa" in model._barqtrain_supported_attention_backends
 
 
 @pytest.mark.parametrize(

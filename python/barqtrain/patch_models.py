@@ -44,6 +44,8 @@ def _configure_attention_backend(model: torch.nn.Module, model_label: str) -> Op
     """
     Configure the model to use FlashAttention or SDPA when available.
     """
+    from barqtrain.attention import available_attention_backends
+
     config = getattr(model, "config", None)
     backend = _preferred_attention_backend()
     if config is None or backend is None:
@@ -56,6 +58,7 @@ def _configure_attention_backend(model: torch.nn.Module, model_label: str) -> Op
     setattr(config, "_attn_implementation", backend)
     if hasattr(config, "attn_implementation"):
         setattr(config, "attn_implementation", backend)
+    setattr(model, "_barqtrain_supported_attention_backends", available_attention_backends())
 
     print(f"BarqTrain: Enabled {backend} attention backend for {model_label}")
     return backend
