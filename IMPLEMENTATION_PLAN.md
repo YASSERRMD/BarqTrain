@@ -6,8 +6,8 @@ This plan turns the project into a native memory-and-throughput stack in phased,
 
 Status update:
 
-- Phases 1 through 8 are now shipped in BarqTrain.
-- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 9.
+- Phases 1 through 9 are now shipped in BarqTrain.
+- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 10.
 
 ## Objective
 
@@ -30,10 +30,11 @@ What BarqTrain already does in native code:
 - activation-checkpointing presets for attention/MLP hot paths plus stability/VRAM benchmarks
 - native optimizer-state layouts with full, compact, and paged AdamW-compatible modes
 - RMSNorm block-fusion helpers and benchmark reporting for residual-add, attention-projection, and MLP-projection patterns
+- attention dispatch helpers covering RoPE, cache materialization, last-token decode specialization, and FlashAttention/SDPA fallback routing
 
 What is still missing for the remaining roadmap:
 
-- decode-heavy attention fusion and deeper fused LoRA
+- deeper fused LoRA and future cache compaction/offload
 
 ## Why The Current Inference VRAM Barely Moves
 

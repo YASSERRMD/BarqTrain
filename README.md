@@ -6,7 +6,7 @@
 
 - **Fused RMSNorm**: Single-kernel normalization plus Phase 8 residual-add, attention-projection, and MLP-projection block-fusion helpers with call-site auditing
 - **Fused Vocab Projection + Chunked Loss**: compatible decoder-only training uses the fused LM-head projection/loss path, while decode can request last-token-only logits
-- **FlashAttention Integration**: `patch_model(...)` selects `flash_attention_2` when available and falls back to PyTorch SDPA otherwise
+- **FlashAttention Integration**: `patch_model(...)` keeps FlashAttention as an optional fast path while Phase 9 adds native decode dispatch over contiguous, paged, and quantized KV layouts
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
 - **Padding-Free Packed Training Metadata**: Rust emits `cu_seqlens`, block offsets, position IDs, sequence IDs, document IDs, and loss masks for packed batches
@@ -25,12 +25,12 @@ BarqTrain is already a useful native acceleration layer, but it is not yet a ful
 | RMSNorm | Phase 8 shipped | residual-add, attention-projection, and MLP-projection fusion helpers plus call-site auditing | broader model-family integration of the fused blocks |
 | Cross-entropy and decode projection | Phase 4 shipped | fused LM-head projection/loss path plus last-token decode specialization | deeper vocab/head fusion across more model families |
 | Data path | Phase 5 shipped | Rust packing plus padding-free training metadata, masked packed-loss consumption, and padded fallback benchmarking | activation-memory control presets and broader model patching |
-| Attention | backend selection shipped | faster attention when FlashAttention is available | deeper native attention fusion |
+| Attention | Phase 9 shipped | native decode dispatch with RoPE, KV materialization, last-token specialization, and FlashAttention/SDPA fallback routing | deeper fused LoRA and future serving-side compaction work |
 | Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | offloaded cache modes and serving-side compaction accounting |
 | KV cache implementation | Phase 2 shipped | paged allocator, page tables, gather/scatter reads, recycler/free-list management, and contiguous fallback | future compaction/offload |
-| Quantized KV cache | Phase 3 shipped | older pages stored in int8 with a recent fp residual window plus quality/memory tradeoff reporting | compaction/offload and deeper attention fusion |
+| Quantized KV cache | Phase 3 shipped | older pages stored in int8 with a recent fp residual window plus quality/memory tradeoff reporting | compaction/offload |
 | Activation memory control | Phase 6 shipped | checkpoint presets for attention/MLP hot paths plus stability/VRAM benchmark reporting | native optimizer-state control |
-| Optimizer memory | Phase 7 shipped | native `barqtrain_adamw`, `barqtrain_adamw_compact`, and `barqtrain_adamw_paged` modes with explicit state accounting | decode-heavy attention fusion and deeper fused LoRA |
+| Optimizer memory | Phase 7 shipped | native `barqtrain_adamw`, `barqtrain_adamw_compact`, and `barqtrain_adamw_paged` modes with explicit state accounting | deeper fused LoRA and future compaction/offload work |
 
 ## Research-Backed Roadmap
 
@@ -368,6 +368,7 @@ BarqTrain should be evaluated in two separate ways:
 - **Activation-memory path**: Phase 6 compares checkpoint presets on the same training state and reports VRAM, tokens/sec, step time, and loss-curve stability.
 - **Optimizer-state path**: Phase 7 compares native optimizer layouts against AdamW and reports state bytes, throughput, and loss deltas.
 - **RMSNorm block-fusion path**: Phase 8 compares separated versus fused residual/norm/projection execution and reports approximate memory-traffic reduction alongside parity.
+- **Attention dispatch path**: Phase 9 compares FlashAttention, native decode dispatch, and SDPA across prefill, decode, and long-context serving workloads.
 
 Shipped benchmark reporting now includes these memory buckets explicitly:
 
@@ -504,10 +505,32 @@ Each Phase 8 RMSNorm fusion report entry records:
 5. `memory_traffic_reduction_percent`
 6. `max_abs_error`
 
+The shipped Phase 9 attention benchmark suite compares these backends across the scenario matrix:
+
+1. `flash_attention_2`
+2. `barqtrain_native_decode`
+3. `sdpa`
+
+The shipped Phase 9 scenario matrix covers:
+
+1. `prefill_throughput`
+2. `decode_throughput`
+3. `long_context_serving`
+
+Each Phase 9 attention report entry records:
+
+1. `attention_backend`
+2. `cache_layout`
+3. `prefill_tokens_per_second`
+4. `decode_tokens_per_second`
+5. `memory_overhead_mb`
+6. `max_abs_error`
+7. `last_token_only`
+
 The remaining roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
-1. decode-heavy attention fusion
-2. deeper fused LoRA and future cache compaction/offload
+1. deeper fused LoRA
+2. future cache compaction/offload
 
 Example Phase 1 report shape:
 
@@ -715,6 +738,26 @@ Example Phase 8 report shape:
       "approximate_memory_traffic_mb": 0.0,
       "memory_traffic_reduction_percent": 0.0,
       "max_abs_error": 0.0
+    }
+  ]
+}
+```
+
+Example Phase 9 report shape:
+
+```json
+{
+  "benchmark_suite": "phase9",
+  "attention_profiles": [
+    {
+      "scenario_name": "decode_throughput",
+      "attention_backend": "barqtrain_native_decode",
+      "cache_layout": "paged",
+      "prefill_tokens_per_second": 0.0,
+      "decode_tokens_per_second": 0.0,
+      "memory_overhead_mb": 0.0,
+      "max_abs_error": 0.0,
+      "last_token_only": true
     }
   ]
 }
