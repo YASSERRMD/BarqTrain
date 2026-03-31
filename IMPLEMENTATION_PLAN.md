@@ -4,6 +4,11 @@ BarqTrain already ships native CUDA kernels for RMSNorm and chunked cross-entrop
 
 This plan turns the project into a native memory-and-throughput stack in phased, measurable steps.
 
+Status update:
+
+- Phases 1 through 4 are now shipped in BarqTrain.
+- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 5.
+
 ## Objective
 
 Build BarqTrain into a native accelerator that improves all three of the following at the same time:
@@ -17,15 +22,17 @@ Build BarqTrain into a native accelerator that improves all three of the followi
 What BarqTrain already does in native code:
 
 - CUDA fused RMSNorm
-- CUDA chunked cross-entropy to avoid full logits materialization during training
+- CUDA chunked cross-entropy plus fused LM-head projection/loss routing for compatible decoder-only training
 - Rust sequence packing for the causal-LM data path
+- native memory accounting with resident/KV/decode/training/inference buckets
+- CUDA paged and quantized KV-cache paths with runtime selection and reporting
 
-What is still missing for meaningful inference-memory reduction:
+What is still missing for the remaining roadmap:
 
-- native KV-cache management
-- native KV-cache compression / quantization
-- native decode-time logits optimization
 - native padding-free attention path for packed training batches
+- activation-memory control presets around attention/MLP hot paths
+- native optimizer-state layouts for BarqTrain-managed training loops
+- deeper block fusion and decode-heavy attention fusion
 
 ## Why The Current Inference VRAM Barely Moves
 
