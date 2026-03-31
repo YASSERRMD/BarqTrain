@@ -50,6 +50,12 @@ from barqtrain.memory import (
     cuda_memory_snapshot,
     generation_overhead_mb,
 )
+from barqtrain.attention import (
+    available_attention_backends,
+    dispatch_attention,
+    materialize_kv_for_attention,
+    select_attention_backend,
+)
 from barqtrain.kv_cache import (
     BarqContiguousKVCache,
     BarqPagedKVCache,
@@ -89,6 +95,10 @@ __all__ = [
     "cuda_memory_snapshot",
     "generation_overhead_mb",
     "build_generation_kwargs",
+    "available_attention_backends",
+    "dispatch_attention",
+    "materialize_kv_for_attention",
+    "select_attention_backend",
     "BarqContiguousKVCache",
     "BarqPagedKVCache",
     "BarqQuantizedPagedKVCache",
