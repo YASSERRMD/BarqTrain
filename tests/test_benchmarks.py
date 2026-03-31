@@ -75,10 +75,10 @@ class FakeModel(torch.nn.Module):
             logits = logits[:, -1:, :]
         loss = None
         if labels is not None:
-            full_logits = self.lm_head(hidden)
+            full_logits = self.lm_head(hidden[:, :-1, :])
             loss = torch.nn.functional.cross_entropy(
-                full_logits.view(-1, full_logits.size(-1)),
-                labels.view(-1),
+                full_logits.reshape(-1, full_logits.size(-1)),
+                labels[:, 1:].reshape(-1),
                 ignore_index=-100,
             )
         return SimpleNamespace(loss=loss, logits=logits)
@@ -280,3 +280,45 @@ def test_phase3_quantized_kv_report_serializes_quality_metrics(monkeypatch, tmp_
     assert "latency_vs_contiguous_percent" in payload
     assert "generation_match_ratio" in payload
     assert "reference_perplexity" in payload
+
+
+def test_phase4_projection_report_serializes_training_and_decode_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+        short_prompt_length=4,
+        long_prompt_length=6,
+        short_decode_length=2,
+        long_decode_length=4,
+    )
+
+    report = harness.run_phase4_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase4"
+    assert len(report.projection_profiles) == 8
+    assert {profile.scenario_name for profile in report.projection_profiles} == {
+        "vocab_heavy_long_decode",
+        "vocab_heavy_long_context",
+    }
+    assert {profile.projection_mode for profile in report.projection_profiles} == {"baseline", "fused"}
+    fused_profiles = [profile for profile in report.projection_profiles if profile.projection_mode == "fused"]
+    assert all(profile.last_token_logits_only is True for profile in fused_profiles)
+    assert all(profile.generation_match_ratio == 1.0 for profile in report.projection_profiles)
+    assert all(abs(profile.loss_delta_vs_baseline) < 1e-6 for profile in fused_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase4_results.json"
+    assert "projection_mode" in payload
+    assert "training_step_time_seconds" in payload
+    assert "decode_tokens_per_second" in payload
+    assert "loss_delta_vs_baseline" in payload
+    assert "last_token_logits_only" in payload

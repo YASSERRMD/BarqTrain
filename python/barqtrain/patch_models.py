@@ -7,6 +7,7 @@ with BarqTrain's optimized CUDA kernels and Rust operations.
 
 import importlib
 import importlib.util
+import inspect
 import types
 from functools import lru_cache
 from typing import Optional
@@ -150,6 +151,11 @@ def _patch_causal_lm_chunked_loss(
         return model
 
     original_forward = model.forward
+    try:
+        original_forward_signature = inspect.signature(original_forward)
+        original_forward_parameters = set(original_forward_signature.parameters)
+    except (TypeError, ValueError):
+        original_forward_parameters = set()
 
     def forward(
         self,
@@ -163,10 +169,15 @@ def _patch_causal_lm_chunked_loss(
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        logits_to_keep=None,
+        num_logits_to_keep=None,
         **kwargs,
     ):
         use_return_dict = (
             return_dict if return_dict is not None else getattr(self.config, "use_return_dict", True)
+        )
+        requested_logits_to_keep = (
+            logits_to_keep if logits_to_keep is not None else num_logits_to_keep
         )
         use_chunked_loss = (
             labels is not None
@@ -175,8 +186,24 @@ def _patch_causal_lm_chunked_loss(
             and getattr(self, "_barqtrain_chunked_loss_enabled", True)
             and past_key_values is None
         )
+        use_last_token_projection = (
+            labels is None
+            and use_return_dict
+            and getattr(self, "_barqtrain_last_token_projection_enabled", True)
+            and requested_logits_to_keep is not None
+            and int(requested_logits_to_keep) == 1
+            and not bool(kwargs.get("output_logits", False))
+        )
 
-        if not use_chunked_loss:
+        setattr(self, "_barqtrain_last_forward_used_fused_lm_head_loss", use_chunked_loss)
+        setattr(self, "_barqtrain_last_forward_used_last_token_projection", use_last_token_projection)
+
+        if not use_chunked_loss and not use_last_token_projection:
+            forward_kwargs = dict(kwargs)
+            if "logits_to_keep" in original_forward_parameters and logits_to_keep is not None:
+                forward_kwargs["logits_to_keep"] = logits_to_keep
+            if "num_logits_to_keep" in original_forward_parameters and num_logits_to_keep is not None:
+                forward_kwargs["num_logits_to_keep"] = num_logits_to_keep
             return original_forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -188,10 +215,13 @@ def _patch_causal_lm_chunked_loss(
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                **kwargs,
+                **forward_kwargs,
             )
 
-        from barqtrain.ops import chunked_cross_entropy_loss
+        from barqtrain.ops import (
+            fused_lm_head_cross_entropy_loss,
+            fused_lm_head_projection,
+        )
 
         model_outputs = self.model(
             input_ids=input_ids,
@@ -210,17 +240,27 @@ def _patch_causal_lm_chunked_loss(
         if hidden_states is None:
             hidden_states = model_outputs[0]
 
-        shift_hidden_states = hidden_states[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        loss = chunked_cross_entropy_loss(
-            shift_hidden_states,
-            self.lm_head.weight,
-            shift_labels,
-        )
+        loss = None
+        logits = None
+
+        if use_chunked_loss:
+            loss = fused_lm_head_cross_entropy_loss(
+                hidden_states,
+                self.lm_head.weight,
+                labels,
+                shift=True,
+            )
+
+        if use_last_token_projection:
+            logits = fused_lm_head_projection(
+                hidden_states,
+                self.lm_head.weight,
+                last_token_only=True,
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,
-            logits=None,
+            logits=logits,
             past_key_values=getattr(model_outputs, "past_key_values", None),
             hidden_states=getattr(model_outputs, "hidden_states", None),
             attentions=getattr(model_outputs, "attentions", None),
@@ -379,6 +419,7 @@ def patch_inference(model: torch.nn.Module) -> torch.nn.Module:
     model_config = getattr(model, "config", None)
     model_type = getattr(model_config, "model_type", None) or "model"
     _configure_attention_backend(model, model_type)
+    model = _patch_causal_lm_chunked_loss(model, model_type)
     return _patch_generate_with_paged_kv(model, model_type)
 
 

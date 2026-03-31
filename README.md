@@ -5,7 +5,7 @@
 ## Features
 
 - **Fused RMSNorm**: Single-kernel normalization reducing HBM bandwidth by 3-4x
-- **Chunked Cross-Entropy**: Avoids logit materialization, saving up to 60% VRAM for large vocabularies
+- **Fused Vocab Projection + Chunked Loss**: compatible decoder-only training uses the fused LM-head projection/loss path, while decode can request last-token-only logits
 - **FlashAttention Integration**: `patch_model(...)` selects `flash_attention_2` when available and falls back to PyTorch SDPA otherwise
 - **Fused LoRA**: Single-pass GEMM combining base weights and LoRA adapters
 - **Rust Data Pipeline**: Native causal-LM sequence packing with zero GIL contention
@@ -20,7 +20,7 @@ BarqTrain is already a useful native acceleration layer, but it is not yet a ful
 | Area | Shipped Today | Benefit Today | Roadmap Next |
 |------|---------------|---------------|--------------|
 | RMSNorm | CUDA kernel shipped | lower kernel overhead | deeper fusion into larger blocks |
-| Cross-entropy | CUDA chunked loss shipped | lower training memory and better training throughput | more fused projection-plus-loss work |
+| Cross-entropy and decode projection | Phase 4 shipped | fused LM-head projection/loss path plus last-token decode specialization | deeper vocab/head fusion across more model families |
 | Data path | Rust packing shipped | lower Python overhead and less padding waste | padding-free end-to-end training path |
 | Attention | backend selection shipped | faster attention when FlashAttention is available | deeper native attention fusion |
 | Inference memory accounting | Phase 1 shipped | resident/KV/decode bucket reporting plus last-token decode cleanup | offloaded cache modes and serving-side compaction accounting |
@@ -250,7 +250,7 @@ BARQTRAIN_CUDA_ARCH_LIST=7.5 BARQTRAIN_BUILD_CUDA=1 python -m pip install -e . -
 
 BarqTrain exposes thin helpers for the optimized training path:
 
-- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through chunked loss, and wraps compatible CUDA generation calls to inject BarqTrain's native KV cache automatically (`paged`, `contiguous`, `paged_quantized`, or `auto`)
+- `patch_model(model)`: patches supported RMSNorm layers, configures the best attention backend available, routes compatible decoder-only training with labels through the fused LM-head projection/loss path, and wraps compatible CUDA generation calls to inject BarqTrain's native KV cache automatically (`paged`, `contiguous`, `paged_quantized`, or `auto`)
 - `patch_inference(model)`: inference-only patching path for decode benchmarks and low-memory generation experiments
 - `PackedCausalLMDataCollator(...)`: uses the Rust packing backend for denser causal-LM batches
 - `create_optimizer(...)`: selects `adamw`, `paged_adamw_32bit`, or `paged_adamw_8bit`
@@ -318,7 +318,7 @@ cache = create_kv_cache(model, max_batch_size=1, max_cache_len=256, page_size=16
 outputs = model.generate(**inputs, max_new_tokens=64, past_key_values=cache)
 ```
 
-Runtime selection is also available via `BARQTRAIN_KV_CACHE_MODE=auto|paged|contiguous|paged_quantized`. The quantized path uses `BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS` to keep a recent fp16/bf16 window while older pages are stored in int8. Detailed native memory bucket collection remains gated behind `BARQTRAIN_DETAILED_PROFILING=1` so release-path overhead stays minimal.
+Runtime selection is also available via `BARQTRAIN_KV_CACHE_MODE=auto|paged|contiguous|paged_quantized`. The quantized path uses `BARQTRAIN_QUANTIZED_KV_RESIDUAL_TOKENS` to keep a recent fp16/bf16 window while older pages are stored in int8. `BARQTRAIN_LAST_TOKEN_LOGITS_ONLY=1` keeps generation on the last-token projection path by default, while `BARQTRAIN_LAST_TOKEN_LOGITS_ONLY=0` forces the full-logits fallback. Detailed native memory bucket collection remains gated behind `BARQTRAIN_DETAILED_PROFILING=1` so release-path overhead stays minimal.
 
 
 ```python
@@ -355,7 +355,7 @@ trainer.train()
 BarqTrain should be evaluated in two separate ways:
 
 - **Training path**: chunked loss and packed data can reduce activation or loss-path pressure and improve throughput.
-- **Inference path**: Phase 1 reports memory buckets separately, Phase 2 compares paged versus contiguous KV-cache behavior, and Phase 3 extends that to quantized older pages with explicit quality/memory tradeoffs.
+- **Inference path**: Phase 1 reports memory buckets separately, Phase 2 compares paged versus contiguous KV-cache behavior, Phase 3 extends that to quantized older pages with explicit quality/memory tradeoffs, and Phase 4 measures fused LM-head projection/loss versus the full-logits fallback.
 
 Shipped benchmark reporting now includes these memory buckets explicitly:
 
@@ -408,14 +408,30 @@ Each Phase 3 quantized KV report entry records:
 6. `reference_perplexity`
 7. the same resident, peak, and bucketed memory fields used by earlier suites
 
+The shipped Phase 4 fused projection benchmark suite compares `baseline` and `fused` projection modes on:
+
+1. `vocab_heavy_long_decode`
+2. `vocab_heavy_long_context`
+
+Each Phase 4 projection report entry records:
+
+1. `projection_mode`
+2. `training_step_time_seconds`
+3. `decode_tokens_per_second`
+4. `training_peak_vram_mb`
+5. `inference_peak_vram_mb`
+6. `loss_delta_vs_baseline`
+7. `generation_match_ratio`
+8. `last_token_logits_only`
+9. the same bucketed `memory` breakdown used by earlier suites
+
 The remaining roadmap in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) therefore prioritizes:
 
-1. fused projection-plus-loss improvements
-2. padding-free packed training
-3. activation-memory control
-4. native optimizer-state control
-5. deeper block fusion and decode-heavy attention fusion
-6. future cache compaction/offload
+1. padding-free packed training
+2. activation-memory control
+3. native optimizer-state control
+4. deeper block fusion and decode-heavy attention fusion
+5. future cache compaction/offload
 
 Example Phase 1 report shape:
 
@@ -489,6 +505,34 @@ Example Phase 3 report shape:
       "generation_match_ratio": 1.0,
       "perplexity": 0.0,
       "reference_perplexity": 0.0,
+      "memory": {
+        "resident_model_mb": 0.0,
+        "kv_cache_mb": 0.0,
+        "temporary_decode_buffers_mb": 0.0,
+        "training_peak_vram_mb": 0.0,
+        "inference_peak_vram_mb": 0.0
+      }
+    }
+  ]
+}
+```
+
+Example Phase 4 report shape:
+
+```json
+{
+  "benchmark_suite": "phase4",
+  "projection_profiles": [
+    {
+      "scenario_name": "vocab_heavy_long_decode",
+      "projection_mode": "fused",
+      "training_step_time_seconds": 0.0,
+      "decode_tokens_per_second": 0.0,
+      "training_peak_vram_mb": 0.0,
+      "inference_peak_vram_mb": 0.0,
+      "loss_delta_vs_baseline": 0.0,
+      "generation_match_ratio": 1.0,
+      "last_token_logits_only": true,
       "memory": {
         "resident_model_mb": 0.0,
         "kv_cache_mb": 0.0,

@@ -86,6 +86,15 @@ class KVCacheBenchmarkProfile:
     fixed_vram_budget_mb: int = 0
 
 
+@dataclass(frozen=True)
+class ProjectionBenchmarkProfile:
+    name: str
+    batch_size: int
+    sequence_length: int
+    prompt_length: int
+    decode_length: int
+
+
 def generation_overhead_mb(
     resident_snapshot: CudaMemorySnapshot,
     peak_snapshot: CudaMemorySnapshot,
@@ -527,6 +536,62 @@ def phase3_quantized_kv_profiles(
     return profiles
 
 
+def phase4_vocab_projection_profiles(
+    batch_sizes: Sequence[int] = (1, 4, 8),
+    *,
+    sequence_length: int = 512,
+    short_prompt_length: int = 64,
+    long_prompt_length: int = 1024,
+    short_decode_length: int = 32,
+    long_decode_length: int = 256,
+) -> list[ProjectionBenchmarkProfile]:
+    """
+    Return the required Phase 4 fused projection benchmark matrix.
+    """
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "phase4_vocab_projection_profiles"):
+        native_profiles = rust_backend.phase4_vocab_projection_profiles(
+            list(batch_sizes),
+            int(sequence_length),
+            int(short_prompt_length),
+            int(long_prompt_length),
+            int(short_decode_length),
+            int(long_decode_length),
+        )
+        return [
+            ProjectionBenchmarkProfile(
+                name=str(profile.name),
+                batch_size=int(profile.batch_size),
+                sequence_length=int(profile.sequence_length),
+                prompt_length=int(profile.prompt_length),
+                decode_length=int(profile.decode_length),
+            )
+            for profile in native_profiles
+        ]
+
+    profiles: list[ProjectionBenchmarkProfile] = []
+    for batch_size in batch_sizes:
+        profiles.append(
+            ProjectionBenchmarkProfile(
+                name="vocab_heavy_long_decode",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                prompt_length=int(short_prompt_length),
+                decode_length=int(long_decode_length),
+            )
+        )
+        profiles.append(
+            ProjectionBenchmarkProfile(
+                name="vocab_heavy_long_context",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                prompt_length=int(long_prompt_length),
+                decode_length=int(short_decode_length),
+            )
+        )
+    return profiles
+
+
 def _model_forward_parameter_name(
     model: torch.nn.Module,
     candidates: tuple[str, ...],
@@ -636,6 +701,7 @@ __all__ = [
     "CudaMemorySnapshot",
     "DecodeBenchmarkProfile",
     "KVCacheBenchmarkProfile",
+    "ProjectionBenchmarkProfile",
     "build_generation_kwargs",
     "build_memory_breakdown",
     "capture_cuda_peak_bytes",
@@ -650,6 +716,7 @@ __all__ = [
     "phase1_inference_profiles",
     "phase2_kv_cache_profiles",
     "phase3_quantized_kv_profiles",
+    "phase4_vocab_projection_profiles",
     "preferred_last_token_logits_kwarg",
     "record_inference_peak_bytes",
     "record_training_peak_bytes",

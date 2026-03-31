@@ -221,8 +221,8 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
             # Fallback to PyTorch autograd for correctness.
             logits = torch.nn.functional.linear(hidden_states, lm_head_weight)
             loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
                 reduction="mean",
                 ignore_index=-100,
             )
@@ -257,8 +257,8 @@ class ChunkedCrossEntropyFunction(torch.autograd.Function):
                 lm_head_re = lm_head_weight.detach().requires_grad_(True)
                 logits = torch.nn.functional.linear(hidden_states_re, lm_head_re)
                 loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
                     reduction="mean",
                     ignore_index=-100,
                 )
@@ -301,6 +301,57 @@ def chunked_cross_entropy_loss(
         >>> loss = chunked_cross_entropy_loss(hidden, lm_head, labels)
     """
     return ChunkedCrossEntropyFunction.apply(hidden_states, lm_head_weight, labels)
+
+
+def fused_lm_head_projection(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    *,
+    last_token_only: bool = False,
+) -> torch.Tensor:
+    """
+    Project hidden states through the LM head, optionally keeping only the decode token.
+
+    This is the decode-oriented counterpart to the chunked loss path: it avoids
+    materializing full-sequence logits when the caller only needs the last token.
+    """
+    if last_token_only:
+        hidden_states = hidden_states[..., -1:, :]
+
+    if hidden_states.is_cuda and _get_cuda_backend() is None:
+        _warn_cuda_fallback_once()
+
+    return F.linear(hidden_states, lm_head_weight)
+
+
+def fused_lm_head_cross_entropy_loss(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    shift: bool = True,
+) -> torch.Tensor:
+    """
+    Compute LM-head projection plus cross-entropy without materializing full logits.
+
+    When `shift=True`, this function accepts decoder hidden states and labels with
+    matching sequence length and applies the standard next-token causal LM shift.
+    """
+    projected_hidden_states = hidden_states
+    target_labels = labels
+    if shift:
+        projected_hidden_states = hidden_states[..., :-1, :]
+        target_labels = labels[..., 1:]
+
+    if projected_hidden_states.is_cuda and _get_cuda_backend() is not None:
+        projected_hidden_states = projected_hidden_states.contiguous()
+        target_labels = target_labels.contiguous()
+
+    return chunked_cross_entropy_loss(
+        projected_hidden_states,
+        lm_head_weight,
+        target_labels,
+    )
 
 
 class FlashAttentionFunction(torch.autograd.Function):
@@ -467,6 +518,8 @@ __all__ = [
     "FusedRMSNorm",
     "ChunkedCrossEntropyFunction",
     "chunked_cross_entropy_loss",
+    "fused_lm_head_projection",
+    "fused_lm_head_cross_entropy_loss",
     "FlashAttentionFunction",
     "flash_attention",
 ]

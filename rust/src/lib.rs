@@ -179,6 +179,42 @@ impl KVCacheBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 4 fused projection benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct ProjectionBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub sequence_length: usize,
+    #[pyo3(get)]
+    pub prompt_length: usize,
+    #[pyo3(get)]
+    pub decode_length: usize,
+}
+
+#[pymethods]
+impl ProjectionBenchmarkProfile {
+    #[new]
+    fn new(
+        name: String,
+        batch_size: usize,
+        sequence_length: usize,
+        prompt_length: usize,
+        decode_length: usize,
+    ) -> Self {
+        Self {
+            name,
+            batch_size,
+            sequence_length,
+            prompt_length,
+            decode_length,
+        }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -393,6 +429,44 @@ fn phase3_quantized_kv_profiles(
             batch_size,
             request_count: 1,
             fixed_vram_budget_mb: 0,
+        });
+    }
+    profiles
+}
+
+/// Emit the required Phase 4 fused projection benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    sequence_length=512,
+    short_prompt_length=64,
+    long_prompt_length=1024,
+    short_decode_length=32,
+    long_decode_length=256
+))]
+fn phase4_vocab_projection_profiles(
+    batch_sizes: Vec<usize>,
+    sequence_length: usize,
+    short_prompt_length: usize,
+    long_prompt_length: usize,
+    short_decode_length: usize,
+    long_decode_length: usize,
+) -> Vec<ProjectionBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 2);
+    for batch_size in batch_sizes {
+        profiles.push(ProjectionBenchmarkProfile {
+            name: "vocab_heavy_long_decode".to_string(),
+            batch_size,
+            sequence_length,
+            prompt_length: short_prompt_length,
+            decode_length: long_decode_length,
+        });
+        profiles.push(ProjectionBenchmarkProfile {
+            name: "vocab_heavy_long_context".to_string(),
+            batch_size,
+            sequence_length,
+            prompt_length: long_prompt_length,
+            decode_length: short_decode_length,
         });
     }
     profiles
@@ -671,6 +745,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<MemoryBreakdown>()?;
     m.add_class::<DecodeBenchmarkProfile>()?;
     m.add_class::<KVCacheBenchmarkProfile>()?;
+    m.add_class::<ProjectionBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -681,5 +756,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase1_decode_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase2_kv_cache_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_quantized_kv_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase4_vocab_projection_profiles, m)?)?;
     Ok(())
 }
