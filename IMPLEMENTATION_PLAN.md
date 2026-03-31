@@ -6,8 +6,9 @@ This plan turns the project into a native memory-and-throughput stack in phased,
 
 Status update:
 
-- Phases 1 through 9 are now shipped in BarqTrain.
-- The sections below keep those phases as rationale/reference, but the remaining implementation roadmap starts at Phase 10.
+- Phases 1 through 10 are now shipped in BarqTrain.
+- The sections below remain as design rationale and implementation history for the shipped work.
+- Remaining roadmap work is now follow-on integration, broader model-family coverage, and future cache compaction/offload.
 
 ## Objective
 
@@ -34,7 +35,8 @@ What BarqTrain already does in native code:
 
 What is still missing for the remaining roadmap:
 
-- deeper fused LoRA and future cache compaction/offload
+- broader model-family integration for the shipped kernels and patch paths
+- future cache compaction/offload
 
 ## Why The Current Inference VRAM Barely Moves
 
