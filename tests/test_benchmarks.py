@@ -511,3 +511,38 @@ def test_phase5_packed_training_report_serializes_padding_free_metrics(monkeypat
     assert "effective_tokens_per_second" in payload
     assert "throughput_at_matched_effective_tokens" in payload
     assert "loss_delta_vs_padded" in payload
+
+
+def test_phase6_checkpoint_report_serializes_preset_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=2,
+        output_dir=str(tmp_path),
+    )
+
+    report = harness.run_phase6_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase6"
+    assert len(report.checkpoint_profiles) == 3
+    assert {profile.preset_name for profile in report.checkpoint_profiles} == {
+        "max_throughput",
+        "balanced",
+        "max_memory_saving",
+    }
+    assert all(profile.total_steps >= 1 for profile in report.checkpoint_profiles)
+    assert all(profile.peak_vram_mb == profile.memory.training_peak_vram_mb for profile in report.checkpoint_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase6_results.json"
+    assert "preset_name" in payload
+    assert "tokens_per_second" in payload
+    assert "avg_step_time_seconds" in payload
+    assert "loss_stddev" in payload
+    assert "loss_delta_vs_max_throughput" in payload
