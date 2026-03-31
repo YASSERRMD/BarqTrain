@@ -546,3 +546,38 @@ def test_phase6_checkpoint_report_serializes_preset_metrics(monkeypatch, tmp_pat
     assert "avg_step_time_seconds" in payload
     assert "loss_stddev" in payload
     assert "loss_delta_vs_max_throughput" in payload
+
+
+def test_phase7_optimizer_report_serializes_state_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=4,
+        num_steps=2,
+        output_dir=str(tmp_path),
+    )
+
+    report = harness.run_phase7_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase7"
+    assert len(report.optimizer_profiles) == 4
+    assert {profile.optimizer_name for profile in report.optimizer_profiles} == {
+        "adamw",
+        "barqtrain_adamw",
+        "barqtrain_adamw_compact",
+        "barqtrain_adamw_paged",
+    }
+    assert all(profile.optimizer_state_mb >= 0.0 for profile in report.optimizer_profiles)
+    assert all(profile.memory.training_peak_vram_mb >= 0.0 for profile in report.optimizer_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase7_results.json"
+    assert "optimizer_name" in payload
+    assert "optimizer_state_mb" in payload
+    assert "tokens_per_second" in payload
+    assert "loss_delta_vs_adamw" in payload
