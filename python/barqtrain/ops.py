@@ -6,6 +6,7 @@ CUDA kernels, enabling seamless integration with the PyTorch ecosystem.
 """
 
 import warnings
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -354,6 +355,79 @@ def fused_lm_head_cross_entropy_loss(
     )
 
 
+def padding_free_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Apply causal attention over packed sequences without padded tokens.
+
+    Args:
+        q: Query tensor of shape [total_tokens, n_heads, d_head]
+        k: Key tensor of shape [total_tokens, n_heads, d_head]
+        v: Value tensor of shape [total_tokens, n_heads, d_head]
+        cu_seqlens: Optional prefix-sum offsets delimiting packed sequences.
+            When omitted, the function falls back to a single causal sequence.
+    """
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        raise ValueError("padding_free_attention expects [total_tokens, n_heads, d_head] tensors")
+
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, q.size(0)], device=q.device, dtype=torch.long)
+    else:
+        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.long).flatten()
+
+    outputs = torch.empty_like(q)
+    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        if end <= start:
+            continue
+        q_segment = q[start:end].transpose(0, 1).unsqueeze(0)
+        k_segment = k[start:end].transpose(0, 1).unsqueeze(0)
+        v_segment = v[start:end].transpose(0, 1).unsqueeze(0)
+        segment_output = F.scaled_dot_product_attention(
+            q_segment,
+            k_segment,
+            v_segment,
+            attn_mask=None,
+            is_causal=True,
+        )
+        outputs[start:end] = segment_output.squeeze(0).transpose(0, 1)
+    return outputs
+
+
+def padding_free_chunked_cross_entropy_loss(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Compute chunked cross-entropy over packed hidden states and masked targets.
+
+    Args:
+        hidden_states: Hidden states of shape [total_tokens, hidden_dim] or
+            [batch, seq_len, hidden_dim].
+        lm_head_weight: LM head weight [vocab_size, hidden_dim]
+        labels: Labels of shape [total_tokens] or [batch, seq_len]
+        loss_mask: Optional mask where 1 keeps a target and 0 drops it.
+    """
+    if hidden_states.dim() == 2:
+        hidden_states = hidden_states.unsqueeze(0)
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(0)
+
+    if loss_mask is not None:
+        if loss_mask.dim() == 1:
+            loss_mask = loss_mask.unsqueeze(0)
+        labels = labels.masked_fill(~loss_mask.bool(), -100)
+
+    return chunked_cross_entropy_loss(hidden_states, lm_head_weight, labels)
+
+
 class FlashAttentionFunction(torch.autograd.Function):
     """
     FlashAttention with fused Rotary Positional Embeddings (RoPE).
@@ -520,6 +594,8 @@ __all__ = [
     "chunked_cross_entropy_loss",
     "fused_lm_head_projection",
     "fused_lm_head_cross_entropy_loss",
+    "padding_free_attention",
+    "padding_free_chunked_cross_entropy_loss",
     "FlashAttentionFunction",
     "flash_attention",
 ]
