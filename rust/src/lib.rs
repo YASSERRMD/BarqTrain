@@ -275,6 +275,38 @@ impl ProjectionBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 5 packed training benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct PackedTrainingBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub sequence_length: usize,
+    #[pyo3(get)]
+    pub document_masked: bool,
+}
+
+#[pymethods]
+impl PackedTrainingBenchmarkProfile {
+    #[new]
+    fn new(
+        name: String,
+        batch_size: usize,
+        sequence_length: usize,
+        document_masked: bool,
+    ) -> Self {
+        Self {
+            name,
+            batch_size,
+            sequence_length,
+            document_masked,
+        }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -527,6 +559,34 @@ fn phase4_vocab_projection_profiles(
             sequence_length,
             prompt_length: long_prompt_length,
             decode_length: short_decode_length,
+        });
+    }
+    profiles
+}
+
+/// Emit the required Phase 5 packed training benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    sequence_length=512
+))]
+fn phase5_packed_training_profiles(
+    batch_sizes: Vec<usize>,
+    sequence_length: usize,
+) -> Vec<PackedTrainingBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 2);
+    for batch_size in batch_sizes {
+        profiles.push(PackedTrainingBenchmarkProfile {
+            name: "matched_effective_tokens".to_string(),
+            batch_size,
+            sequence_length,
+            document_masked: false,
+        });
+        profiles.push(PackedTrainingBenchmarkProfile {
+            name: "document_masked_training".to_string(),
+            batch_size,
+            sequence_length,
+            document_masked: true,
         });
     }
     profiles
@@ -1028,6 +1088,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<DecodeBenchmarkProfile>()?;
     m.add_class::<KVCacheBenchmarkProfile>()?;
     m.add_class::<ProjectionBenchmarkProfile>()?;
+    m.add_class::<PackedTrainingBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -1040,5 +1101,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase2_kv_cache_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_quantized_kv_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase4_vocab_projection_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase5_packed_training_profiles, m)?)?;
     Ok(())
 }

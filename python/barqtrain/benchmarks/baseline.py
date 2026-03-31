@@ -22,7 +22,10 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from barqtrain.data import PackedCausalLMDataCollator
+from barqtrain.data import (
+    PackedCausalLMDataCollator,
+    PaddingFreeCausalLMDataCollator,
+)
 from barqtrain.memory import (
     BenchmarkMemoryBreakdown,
     build_generation_kwargs,
@@ -34,8 +37,14 @@ from barqtrain.memory import (
     phase2_kv_cache_profiles,
     phase3_quantized_kv_profiles,
     phase4_vocab_projection_profiles,
+    phase5_packed_training_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
+)
+from barqtrain.ops import (
+    chunked_cross_entropy_loss,
+    padding_free_attention,
+    padding_free_chunked_cross_entropy_loss,
 )
 from barqtrain.optim import create_optimizer
 from barqtrain.patch_models import patch_inference, patch_model
@@ -147,6 +156,25 @@ class ProjectionBenchmarkMetrics:
 
 
 @dataclass
+class PackedTrainingBenchmarkMetrics:
+    """Benchmark metrics for Phase 5 packed-vs-padded training comparisons."""
+
+    scenario_name: str
+    packing_mode: str
+    batch_size: int
+    sequence_length: int
+    document_masked: bool
+    effective_tokens: int
+    step_time_seconds: float
+    effective_tokens_per_second: float
+    throughput_at_matched_effective_tokens: float
+    peak_vram_mb: float
+    loss_value: float
+    loss_delta_vs_padded: float
+    memory: BenchmarkMemoryBreakdown = field(default_factory=BenchmarkMemoryBreakdown)
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -159,6 +187,7 @@ class BenchmarkReport:
     kv_cache_profiles: list[KVCacheBenchmarkMetrics] = field(default_factory=list)
     quantized_kv_profiles: list[QuantizedKVBenchmarkMetrics] = field(default_factory=list)
     projection_profiles: list[ProjectionBenchmarkMetrics] = field(default_factory=list)
+    packed_training_profiles: list[PackedTrainingBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -873,6 +902,265 @@ class BenchmarkHarness:
             projection_profiles=self.run_phase4_vocab_projection_benchmarks(),
         )
 
+    def _phase5_examples(self, batch_size: int, sequence_length: int) -> list[dict[str, object]]:
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
+        examples: list[dict[str, object]] = []
+        for index in range(batch_size):
+            length_delta = (index % 3) * max(sequence_length // 4, 1)
+            length = max(3, sequence_length - length_delta)
+            tokens = [((position + index) % 31) + 1 for position in range(length - 1)]
+            tokens.append(int(eos_token_id))
+            examples.append(
+                {
+                    "input_ids": tokens,
+                    "attention_mask": [1] * len(tokens),
+                    "document_id": index,
+                }
+            )
+        return examples
+
+    @staticmethod
+    def _phase5_attention_layout(hidden_size: int) -> tuple[int, int]:
+        num_heads = min(8, max(hidden_size, 1))
+        while num_heads > 1 and hidden_size % num_heads != 0:
+            num_heads -= 1
+        return num_heads, max(hidden_size // max(num_heads, 1), 1)
+
+    def _build_padded_training_batch(
+        self,
+        examples: Sequence[dict[str, object]],
+        sequence_length: int,
+    ) -> dict[str, torch.Tensor]:
+        pad_token_id = int(getattr(self.tokenizer, "pad_token_id", 0))
+        batch_size = len(examples)
+        input_ids = torch.full((batch_size, sequence_length), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.long)
+        labels = torch.full((batch_size, sequence_length), -100, dtype=torch.long)
+
+        for index, example in enumerate(examples):
+            tokens = list(example["input_ids"])[:sequence_length]
+            length = len(tokens)
+            if length == 0:
+                continue
+            input_ids[index, :length] = torch.tensor(tokens, dtype=torch.long)
+            attention_mask[index, :length] = 1
+            labels[index, :length] = torch.tensor(tokens, dtype=torch.long)
+
+        return {
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "labels": labels.to(self.device),
+        }
+
+    def _run_phase5_training_step(
+        self,
+        *,
+        packing_mode: str,
+        batch_size: int,
+        sequence_length: int,
+        document_masked: bool,
+    ) -> dict[str, float | int]:
+        if self.model is None:
+            self.setup_model_and_tokenizer()
+        if self.model is None or not hasattr(self.model, "get_input_embeddings") or not hasattr(self.model, "lm_head"):
+            raise RuntimeError("phase5 benchmark requires a model with embeddings and an lm_head")
+
+        examples = self._phase5_examples(batch_size, sequence_length)
+        embed_layer = self.model.get_input_embeddings()
+        resident_model_bytes = model_resident_cuda_bytes(self.model)
+        self.model.zero_grad(set_to_none=True)
+
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        self._sync_device()
+        start_time = time.time()
+
+        if packing_mode == "padded":
+            batch = self._build_padded_training_batch(examples, sequence_length)
+            hidden_states = embed_layer(batch["input_ids"])
+            hidden_states = hidden_states * batch["attention_mask"].unsqueeze(-1)
+            num_heads, head_dim = self._phase5_attention_layout(hidden_states.size(-1))
+            qkv = hidden_states.reshape(hidden_states.size(0), hidden_states.size(1), num_heads, head_dim)
+            qkv = qkv.permute(0, 2, 1, 3)
+            attended = torch.nn.functional.scaled_dot_product_attention(
+                qkv,
+                qkv,
+                qkv,
+                attn_mask=None,
+                is_causal=True,
+            )
+            attended = attended.permute(0, 2, 1, 3).reshape(hidden_states.size(0), hidden_states.size(1), -1)
+            loss = chunked_cross_entropy_loss(
+                attended[:, :-1, :],
+                self.model.lm_head.weight,
+                batch["labels"][:, 1:],
+            )
+            effective_tokens = int(batch["labels"][:, 1:].ne(-100).sum().item())
+        else:
+            collator = PaddingFreeCausalLMDataCollator(
+                max_length=sequence_length,
+                pad_token_id=int(getattr(self.tokenizer, "pad_token_id", 0)),
+                eos_token_id=int(getattr(self.tokenizer, "eos_token_id", 0)),
+                document_masked=document_masked,
+            )
+            batch = collator(examples)
+            input_ids = batch["input_ids"].to(self.device)
+            hidden_states = embed_layer(input_ids)
+            num_heads, head_dim = self._phase5_attention_layout(hidden_states.size(-1))
+
+            flat_hidden_segments = []
+            flat_labels = []
+            flat_loss_masks = []
+            global_cu_seqlens = [0]
+            running_tokens = 0
+
+            for index in range(hidden_states.size(0)):
+                active_tokens = int(batch["active_tokens"][index].item())
+                if active_tokens <= 0:
+                    continue
+                flat_hidden_segments.append(
+                    hidden_states[index, :active_tokens, :].reshape(active_tokens, num_heads, head_dim)
+                )
+                flat_labels.append(batch["labels"][index, :active_tokens])
+                loss_mask_block = batch["loss_mask"][index, :active_tokens].clone()
+                if index > 0 and active_tokens > 0:
+                    loss_mask_block[0] = 0
+                flat_loss_masks.append(loss_mask_block)
+
+                cu_values = batch["cu_seqlens"][index].tolist()
+                deduped = [0]
+                for value in cu_values[1:]:
+                    value = int(value)
+                    if value == deduped[-1]:
+                        continue
+                    deduped.append(value)
+                    if value >= active_tokens:
+                        break
+                if deduped[-1] != active_tokens:
+                    deduped.append(active_tokens)
+                for value in deduped[1:]:
+                    global_cu_seqlens.append(running_tokens + value)
+                running_tokens += active_tokens
+
+            hidden_flat = torch.cat(flat_hidden_segments, dim=0).to(self.device)
+            labels_flat = torch.cat(flat_labels, dim=0).to(self.device)
+            loss_mask_flat = torch.cat(flat_loss_masks, dim=0).to(self.device)
+            cu_seqlens = torch.tensor(global_cu_seqlens, device=self.device, dtype=torch.long)
+            attended = padding_free_attention(
+                hidden_flat,
+                hidden_flat,
+                hidden_flat,
+                cu_seqlens=cu_seqlens,
+            ).reshape(1, hidden_flat.size(0), -1)
+            loss = padding_free_chunked_cross_entropy_loss(
+                attended[:, :-1, :],
+                self.model.lm_head.weight,
+                labels_flat[1:].unsqueeze(0),
+                loss_mask=loss_mask_flat[1:].unsqueeze(0),
+            )
+            effective_tokens = int(loss_mask_flat[1:].sum().item())
+
+        loss.backward()
+        self._sync_device()
+        total_time = time.time() - start_time
+        training_peak_bytes = capture_cuda_peak_bytes()
+        record_training_peak_bytes(training_peak_bytes)
+        self.model.zero_grad(set_to_none=True)
+
+        return {
+            "resident_model_bytes": resident_model_bytes,
+            "training_peak_bytes": training_peak_bytes,
+            "step_time_seconds": total_time,
+            "effective_tokens": effective_tokens,
+            "loss_value": float(loss.detach().float().item()),
+        }
+
+    def run_phase5_packed_training_benchmarks(self) -> list[PackedTrainingBenchmarkMetrics]:
+        """Run the Phase 5 padded-vs-packed training benchmark matrix."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 5 Packed Training Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Batch Sizes: {', '.join(str(size) for size in self.inference_batch_sizes)}")
+        print(f"Detailed Profiling: {self.detailed_profiling}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        set_detailed_profiling_enabled(self.detailed_profiling)
+        self.setup_model_and_tokenizer()
+        self.model.train()
+
+        profiles = phase5_packed_training_profiles(
+            self.inference_batch_sizes,
+            sequence_length=self.sequence_length,
+        )
+
+        metrics: list[PackedTrainingBenchmarkMetrics] = []
+        padded_baselines: dict[tuple[str, int, bool], dict[str, float | int]] = {}
+
+        for packing_mode in ("padded", "packed"):
+            for profile in profiles:
+                result = self._run_phase5_training_step(
+                    packing_mode=packing_mode,
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    document_masked=profile.document_masked,
+                )
+                key = (profile.name, profile.batch_size, profile.document_masked)
+                baseline = padded_baselines.get(key)
+                if baseline is None:
+                    baseline = result
+                    padded_baselines[key] = result
+
+                memory = build_memory_breakdown(
+                    resident_model_bytes=int(result["resident_model_bytes"]),
+                    kv_cache_bytes=0,
+                    temporary_decode_buffer_bytes=0,
+                    training_peak_bytes=int(result["training_peak_bytes"]),
+                    inference_peak_bytes=0,
+                    detailed_profiling=self.detailed_profiling,
+                )
+                metric = PackedTrainingBenchmarkMetrics(
+                    scenario_name=profile.name,
+                    packing_mode=packing_mode,
+                    batch_size=profile.batch_size,
+                    sequence_length=profile.sequence_length,
+                    document_masked=profile.document_masked,
+                    effective_tokens=int(result["effective_tokens"]),
+                    step_time_seconds=float(result["step_time_seconds"]),
+                    effective_tokens_per_second=(
+                        float(result["effective_tokens"]) / max(float(result["step_time_seconds"]), 1e-9)
+                    ),
+                    throughput_at_matched_effective_tokens=(
+                        float(result["effective_tokens"]) / max(float(result["step_time_seconds"]), 1e-9)
+                    ),
+                    peak_vram_mb=memory.training_peak_vram_mb,
+                    loss_value=float(result["loss_value"]),
+                    loss_delta_vs_padded=float(result["loss_value"]) - float(baseline["loss_value"]),
+                    memory=memory,
+                )
+                metrics.append(metric)
+
+                print(
+                    f"{metric.scenario_name} | mode={metric.packing_mode} | "
+                    f"bs={metric.batch_size} | masked={metric.document_masked} | "
+                    f"eff_tok/s={metric.effective_tokens_per_second:.1f} | "
+                    f"peak={metric.peak_vram_mb:.1f} MB | "
+                    f"loss_delta={metric.loss_delta_vs_padded:.6f}"
+                )
+
+        return metrics
+
+    def run_phase5_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 5 packed training benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase5",
+            packed_training_profiles=self.run_phase5_packed_training_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -1057,6 +1345,8 @@ class BenchmarkHarness:
                 filename = "phase3_results.json"
             elif results.benchmark_suite == "phase4":
                 filename = "phase4_results.json"
+            elif results.benchmark_suite == "phase5":
+                filename = "phase5_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -1129,6 +1419,23 @@ class BenchmarkHarness:
                     f"{best_profile.training_peak_vram_mb:.1f} MB / "
                     f"{best_profile.generation_match_ratio:.3f}"
                 )
+            if results.packed_training_profiles:
+                packed_profiles = [
+                    metric for metric in results.packed_training_profiles if metric.packing_mode == "packed"
+                ] or results.packed_training_profiles
+                best_profile = max(
+                    packed_profiles,
+                    key=lambda metric: metric.effective_tokens_per_second,
+                )
+                print(
+                    f"Best Packed Training Scenario: {best_profile.scenario_name} "
+                    f"(bs={best_profile.batch_size}, {best_profile.effective_tokens_per_second:.1f} tok/s)"
+                )
+                print(
+                    f"Packed Peak/Loss Delta: "
+                    f"{best_profile.peak_vram_mb:.1f} MB / "
+                    f"{best_profile.loss_delta_vs_padded:.6f}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -1167,7 +1474,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3", "phase4"],
+        choices=["phase1", "phase2", "phase3", "phase4", "phase5"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -1270,6 +1577,8 @@ def main() -> None:
         )
     elif args.suite == "phase4":
         results = harness.run_phase4_benchmarks()
+    elif args.suite == "phase5":
+        results = harness.run_phase5_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:

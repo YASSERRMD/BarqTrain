@@ -83,6 +83,9 @@ class FakeModel(torch.nn.Module):
             )
         return SimpleNamespace(loss=loss, logits=logits)
 
+    def get_input_embeddings(self):
+        return self.embed
+
     def generate(self, input_ids=None, max_new_tokens=1, logits_to_keep=None, **kwargs):
         del kwargs
         cache_layout = os.environ.get("BARQTRAIN_KV_CACHE_MODE", "contiguous")
@@ -122,6 +125,153 @@ class FakeModel(torch.nn.Module):
 
 
 def _install_fake_runtime(monkeypatch):
+    class FakePaddingFreeCollator:
+        def __init__(
+            self,
+            max_length,
+            pad_token_id,
+            eos_token_id=None,
+            label_pad_token_id=-100,
+            drop_remainder=False,
+            document_masked=False,
+            document_id_key="document_id",
+        ):
+            self.max_length = max_length
+            self.pad_token_id = pad_token_id
+            self.eos_token_id = pad_token_id if eos_token_id is None else eos_token_id
+            self.label_pad_token_id = label_pad_token_id
+            self.drop_remainder = drop_remainder
+            self.document_masked = document_masked
+            self.document_id_key = document_id_key
+
+        def __call__(self, examples):
+            batches = []
+            current_tokens = []
+            current_position_ids = []
+            current_sequence_ids = []
+            current_document_ids = []
+            current_starts = []
+
+            def flush():
+                if not current_tokens:
+                    return
+                active_tokens = len(current_tokens)
+                input_ids = current_tokens + [self.pad_token_id] * (self.max_length - active_tokens)
+                attention_mask = [1] * active_tokens + [0] * (self.max_length - active_tokens)
+                labels = list(current_tokens) + [self.label_pad_token_id] * (self.max_length - active_tokens)
+                if self.document_masked:
+                    for boundary_start in current_starts[1:]:
+                        labels[boundary_start] = self.label_pad_token_id
+                loss_mask = [0 if label == self.label_pad_token_id else 1 for label in labels]
+                position_ids = current_position_ids + [0] * (self.max_length - active_tokens)
+                sequence_ids = current_sequence_ids + [-1] * (self.max_length - active_tokens)
+                document_ids = current_document_ids + [-1] * (self.max_length - active_tokens)
+                cu_seqlens = [0]
+                block_offsets = []
+                for offset in current_starts:
+                    block_offsets.append(offset)
+                for start, end in zip(current_starts, current_starts[1:] + [active_tokens]):
+                    cu_seqlens.append(end)
+                batches.append(
+                    {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "labels": labels,
+                        "position_ids": position_ids,
+                        "sequence_ids": sequence_ids,
+                        "document_ids": document_ids,
+                        "loss_mask": loss_mask,
+                        "cu_seqlens": cu_seqlens,
+                        "block_offsets": block_offsets,
+                        "max_sequence_length": max(
+                            (end - start) for start, end in zip(current_starts, current_starts[1:] + [active_tokens])
+                        ),
+                        "active_tokens": active_tokens,
+                    }
+                )
+
+            for example_index, example in enumerate(examples):
+                tokens = [
+                    token
+                    for token, mask in zip(example["input_ids"], example.get("attention_mask", [1] * len(example["input_ids"])))
+                    if mask
+                ]
+                if not tokens:
+                    continue
+                if tokens[-1] != self.eos_token_id:
+                    tokens = list(tokens) + [self.eos_token_id]
+                if current_tokens and len(current_tokens) + len(tokens) > self.max_length:
+                    flush()
+                    current_tokens = []
+                    current_position_ids = []
+                    current_sequence_ids = []
+                    current_document_ids = []
+                    current_starts = []
+                if self.drop_remainder and len(tokens) > self.max_length:
+                    tokens = tokens[: self.max_length]
+                current_starts.append(len(current_tokens))
+                document_id = int(example.get(self.document_id_key, example_index))
+                for position, token in enumerate(tokens[: self.max_length - len(current_tokens)]):
+                    current_tokens.append(int(token))
+                    current_position_ids.append(position)
+                    current_sequence_ids.append(example_index)
+                    current_document_ids.append(document_id)
+                if len(current_tokens) == self.max_length:
+                    flush()
+                    current_tokens = []
+                    current_position_ids = []
+                    current_sequence_ids = []
+                    current_document_ids = []
+                    current_starts = []
+
+            flush()
+            if not batches:
+                batches = [
+                    {
+                        "input_ids": [self.pad_token_id] * self.max_length,
+                        "attention_mask": [0] * self.max_length,
+                        "labels": [self.label_pad_token_id] * self.max_length,
+                        "position_ids": [0] * self.max_length,
+                        "sequence_ids": [-1] * self.max_length,
+                        "document_ids": [-1] * self.max_length,
+                        "loss_mask": [0] * self.max_length,
+                        "cu_seqlens": [0],
+                        "block_offsets": [],
+                        "max_sequence_length": 0,
+                        "active_tokens": 0,
+                    }
+                ]
+
+            max_cu = max(len(batch["cu_seqlens"]) for batch in batches)
+            max_offsets = max(len(batch["block_offsets"]) for batch in batches)
+            return {
+                "input_ids": torch.tensor([batch["input_ids"] for batch in batches], dtype=torch.long),
+                "attention_mask": torch.tensor([batch["attention_mask"] for batch in batches], dtype=torch.long),
+                "labels": torch.tensor([batch["labels"] for batch in batches], dtype=torch.long),
+                "position_ids": torch.tensor([batch["position_ids"] for batch in batches], dtype=torch.long),
+                "sequence_ids": torch.tensor([batch["sequence_ids"] for batch in batches], dtype=torch.long),
+                "document_ids": torch.tensor([batch["document_ids"] for batch in batches], dtype=torch.long),
+                "loss_mask": torch.tensor([batch["loss_mask"] for batch in batches], dtype=torch.long),
+                "cu_seqlens": torch.tensor(
+                    [
+                        batch["cu_seqlens"] + [batch["cu_seqlens"][-1]] * (max_cu - len(batch["cu_seqlens"]))
+                        for batch in batches
+                    ],
+                    dtype=torch.long,
+                ),
+                "block_offsets": torch.tensor(
+                    [
+                        batch["block_offsets"] + [-1] * (max_offsets - len(batch["block_offsets"]))
+                        for batch in batches
+                    ],
+                    dtype=torch.long,
+                ),
+                "max_sequence_length": torch.tensor(
+                    [batch["max_sequence_length"] for batch in batches], dtype=torch.long
+                ),
+                "active_tokens": torch.tensor([batch["active_tokens"] for batch in batches], dtype=torch.long),
+            }
+
     def fake_setup(self):
         self.tokenizer = FakeTokenizer()
         self.model = FakeModel().to(self.device)
@@ -137,6 +287,10 @@ def _install_fake_runtime(monkeypatch):
     monkeypatch.setattr(BenchmarkHarness, "setup_model_and_tokenizer", fake_setup)
     monkeypatch.setattr(BenchmarkHarness, "prepare_dataset", fake_prepare_dataset)
     monkeypatch.setattr("barqtrain.benchmarks.baseline.patch_inference", lambda model: model)
+    monkeypatch.setattr(
+        "barqtrain.benchmarks.baseline.PaddingFreeCausalLMDataCollator",
+        FakePaddingFreeCollator,
+    )
 
 
 def test_training_benchmark_reports_bucketed_memory(monkeypatch, tmp_path):
@@ -322,3 +476,38 @@ def test_phase4_projection_report_serializes_training_and_decode_metrics(monkeyp
     assert "decode_tokens_per_second" in payload
     assert "loss_delta_vs_baseline" in payload
     assert "last_token_logits_only" in payload
+
+
+def test_phase5_packed_training_report_serializes_padding_free_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=8,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+    )
+
+    report = harness.run_phase5_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase5"
+    assert len(report.packed_training_profiles) == 8
+    assert {profile.scenario_name for profile in report.packed_training_profiles} == {
+        "matched_effective_tokens",
+        "document_masked_training",
+    }
+    assert {profile.packing_mode for profile in report.packed_training_profiles} == {"padded", "packed"}
+    assert all(profile.effective_tokens > 0 for profile in report.packed_training_profiles)
+    assert all(profile.peak_vram_mb == profile.memory.training_peak_vram_mb for profile in report.packed_training_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase5_results.json"
+    assert "packing_mode" in payload
+    assert "effective_tokens_per_second" in payload
+    assert "throughput_at_matched_effective_tokens" in payload
+    assert "loss_delta_vs_padded" in payload
