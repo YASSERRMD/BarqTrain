@@ -41,6 +41,7 @@ from barqtrain.memory import (
     phase4_vocab_projection_profiles,
     phase5_packed_training_profiles,
     phase6_activation_checkpoint_profiles,
+    phase7_optimizer_profiles,
     record_training_peak_bytes,
     set_detailed_profiling_enabled,
 )
@@ -53,7 +54,7 @@ from barqtrain.ops import (
     padding_free_attention,
     padding_free_chunked_cross_entropy_loss,
 )
-from barqtrain.optim import create_optimizer
+from barqtrain.optim import create_optimizer, optimizer_state_bytes
 from barqtrain.patch_models import patch_inference, patch_model
 
 
@@ -197,6 +198,20 @@ class ActivationCheckpointBenchmarkMetrics:
 
 
 @dataclass
+class OptimizerBenchmarkMetrics:
+    """Benchmark metrics for Phase 7 optimizer-state tradeoffs."""
+
+    optimizer_name: str
+    total_steps: int
+    total_tokens: int
+    tokens_per_second: float
+    avg_step_time_seconds: float
+    optimizer_state_mb: float
+    loss_delta_vs_adamw: float
+    memory: BenchmarkMemoryBreakdown = field(default_factory=BenchmarkMemoryBreakdown)
+
+
+@dataclass
 class BenchmarkReport:
     """Combined training + inference benchmark report."""
 
@@ -211,6 +226,7 @@ class BenchmarkReport:
     projection_profiles: list[ProjectionBenchmarkMetrics] = field(default_factory=list)
     packed_training_profiles: list[PackedTrainingBenchmarkMetrics] = field(default_factory=list)
     checkpoint_profiles: list[ActivationCheckpointBenchmarkMetrics] = field(default_factory=list)
+    optimizer_profiles: list[OptimizerBenchmarkMetrics] = field(default_factory=list)
 
 
 @contextmanager
@@ -1309,6 +1325,124 @@ class BenchmarkHarness:
             checkpoint_profiles=self.run_phase6_activation_checkpoint_benchmarks(),
         )
 
+    def run_phase7_optimizer_benchmarks(self) -> list[OptimizerBenchmarkMetrics]:
+        """Run the Phase 7 optimizer-state benchmark suite."""
+        print(f"\n{'='*60}")
+        print("Starting Phase 7 Optimizer Benchmark")
+        print(f"{'='*60}")
+        print(f"Model: {self.model_name}")
+        print(f"Detailed Profiling: {self.detailed_profiling}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        set_detailed_profiling_enabled(self.detailed_profiling)
+        self.setup_model_and_tokenizer()
+        if hasattr(self.model, "model") and hasattr(self.model, "lm_head"):
+            self.model = patch_model(self.model)
+        dataloader = self.prepare_dataset()
+        profiles = phase7_optimizer_profiles(num_steps=min(self.num_steps, 5) or 1)
+        base_state = copy.deepcopy(self.model.state_dict())
+
+        metrics: list[OptimizerBenchmarkMetrics] = []
+        baselines: dict[str, float] = {}
+
+        for profile in profiles:
+            self.model.load_state_dict(base_state)
+            self.model.train()
+            optimizer = create_optimizer(
+                self.model.parameters(),
+                lr=1e-5,
+                optimizer_name=profile.name,
+            )
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            resident_model_bytes = model_resident_cuda_bytes(self.model)
+            total_tokens = 0
+            losses = []
+            total_time = 0.0
+
+            data_iter = iter(dataloader)
+            for _ in range(profile.num_steps):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
+
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch.get("labels")
+                labels = input_ids if labels is None else labels.to(self.device)
+
+                optimizer.zero_grad(set_to_none=True)
+                self._sync_device()
+                start_time = time.time()
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = outputs.loss
+                if loss is None:
+                    raise RuntimeError("phase7 benchmark expected a training loss")
+                loss.backward()
+                optimizer.step()
+                self._sync_device()
+                total_time += time.time() - start_time
+
+                losses.append(float(loss.detach().float().item()))
+                total_tokens += int(labels.ne(-100).sum().item())
+
+            training_peak_bytes = capture_cuda_peak_bytes()
+            record_training_peak_bytes(training_peak_bytes)
+            optimizer_state_mb = optimizer_state_bytes(optimizer) / (1024**2)
+            memory = build_memory_breakdown(
+                resident_model_bytes=resident_model_bytes,
+                kv_cache_bytes=0,
+                temporary_decode_buffer_bytes=0,
+                training_peak_bytes=training_peak_bytes,
+                inference_peak_bytes=0,
+                detailed_profiling=self.detailed_profiling,
+            )
+            adamw_loss = baselines.get("adamw")
+            current_loss_mean = float(sum(losses) / max(len(losses), 1))
+            if adamw_loss is None:
+                baselines["adamw"] = current_loss_mean
+                adamw_loss = current_loss_mean
+
+            metric = OptimizerBenchmarkMetrics(
+                optimizer_name=profile.name,
+                total_steps=profile.num_steps,
+                total_tokens=total_tokens,
+                tokens_per_second=total_tokens / max(total_time, 1e-9),
+                avg_step_time_seconds=total_time / max(profile.num_steps, 1),
+                optimizer_state_mb=optimizer_state_mb,
+                loss_delta_vs_adamw=current_loss_mean - adamw_loss,
+                memory=memory,
+            )
+            metrics.append(metric)
+
+            print(
+                f"{metric.optimizer_name} | steps={metric.total_steps} | "
+                f"tok/s={metric.tokens_per_second:.1f} | "
+                f"step={metric.avg_step_time_seconds:.4f}s | "
+                f"state={metric.optimizer_state_mb:.2f} MB | "
+                f"loss_delta={metric.loss_delta_vs_adamw:.6f}"
+            )
+
+        self.model.load_state_dict(base_state)
+        return metrics
+
+    def run_phase7_benchmarks(self) -> BenchmarkReport:
+        """Run the requested Phase 7 optimizer benchmark suite."""
+        return BenchmarkReport(
+            model_name=self.model_name,
+            optimizer_name=self.optimizer_name,
+            detailed_profiling=self.detailed_profiling,
+            benchmark_suite="phase7",
+            optimizer_profiles=self.run_phase7_optimizer_benchmarks(),
+        )
+
     def run_phase1_benchmarks(self, mode: str = "both") -> BenchmarkReport:
         """Run the requested Phase 1 benchmark modes and return a structured report."""
         include_training = mode in {"training", "both"}
@@ -1497,6 +1631,8 @@ class BenchmarkHarness:
                 filename = "phase5_results.json"
             elif results.benchmark_suite == "phase6":
                 filename = "phase6_results.json"
+            elif results.benchmark_suite == "phase7":
+                filename = "phase7_results.json"
             else:
                 filename = "phase1_results.json"
         results_file = self.output_dir / filename
@@ -1597,6 +1733,17 @@ class BenchmarkHarness:
                     f"{best_profile.peak_vram_mb:.1f} MB / "
                     f"{best_profile.loss_stddev:.6f}"
                 )
+            if results.optimizer_profiles:
+                best_profile = max(results.optimizer_profiles, key=lambda metric: metric.tokens_per_second)
+                print(
+                    f"Fastest Optimizer Mode: {best_profile.optimizer_name} "
+                    f"({best_profile.tokens_per_second:.1f} tok/s)"
+                )
+                print(
+                    f"Optimizer State/Loss Delta: "
+                    f"{best_profile.optimizer_state_mb:.2f} MB / "
+                    f"{best_profile.loss_delta_vs_adamw:.6f}"
+                )
         print(f"\nResults saved to: {results_file}")
         print(f"{'='*60}\n")
         return results_file
@@ -1635,7 +1782,7 @@ def main() -> None:
         "--suite",
         type=str,
         default="phase1",
-        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6"],
+        choices=["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7"],
         help="Which benchmark suite to run",
     )
     parser.add_argument(
@@ -1742,6 +1889,8 @@ def main() -> None:
         results = harness.run_phase5_benchmarks()
     elif args.suite == "phase6":
         results = harness.run_phase6_benchmarks()
+    elif args.suite == "phase7":
+        results = harness.run_phase7_benchmarks()
     elif args.mode == "training":
         results = harness.run_benchmark()
     else:

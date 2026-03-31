@@ -325,6 +325,24 @@ impl ActivationCheckpointBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 7 optimizer benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct OptimizerBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub num_steps: usize,
+}
+
+#[pymethods]
+impl OptimizerBenchmarkProfile {
+    #[new]
+    fn new(name: String, num_steps: usize) -> Self {
+        Self { name, num_steps }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -628,6 +646,33 @@ fn phase6_activation_checkpoint_profiles(
         ActivationCheckpointBenchmarkProfile {
             name: "max_memory_saving".to_string(),
             num_steps: num_steps.max(1),
+        },
+    ]
+}
+
+/// Emit the required Phase 7 optimizer benchmark modes.
+#[pyfunction]
+#[pyo3(signature = (num_steps=5))]
+fn phase7_optimizer_profiles(
+    num_steps: usize,
+) -> Vec<OptimizerBenchmarkProfile> {
+    let steps = num_steps.max(1);
+    vec![
+        OptimizerBenchmarkProfile {
+            name: "adamw".to_string(),
+            num_steps: steps,
+        },
+        OptimizerBenchmarkProfile {
+            name: "barqtrain_adamw".to_string(),
+            num_steps: steps,
+        },
+        OptimizerBenchmarkProfile {
+            name: "barqtrain_adamw_compact".to_string(),
+            num_steps: steps,
+        },
+        OptimizerBenchmarkProfile {
+            name: "barqtrain_adamw_paged".to_string(),
+            num_steps: steps,
         },
     ]
 }
@@ -1130,6 +1175,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ProjectionBenchmarkProfile>()?;
     m.add_class::<PackedTrainingBenchmarkProfile>()?;
     m.add_class::<ActivationCheckpointBenchmarkProfile>()?;
+    m.add_class::<OptimizerBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -1144,5 +1190,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase4_vocab_projection_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase5_packed_training_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase6_activation_checkpoint_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase7_optimizer_profiles, m)?)?;
     Ok(())
 }
