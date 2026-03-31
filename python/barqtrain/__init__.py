@@ -65,7 +65,7 @@ from barqtrain.checkpointing import (
     get_activation_checkpoint_preset,
     reset_activation_checkpointing,
 )
-from barqtrain.optim import create_optimizer
+from barqtrain.optim import BarqTrainAdamW, create_optimizer, optimizer_state_bytes
 
 __all__ = [
     "patch_model",
@@ -100,6 +100,8 @@ __all__ = [
     "apply_activation_checkpointing",
     "get_activation_checkpoint_preset",
     "reset_activation_checkpointing",
+    "BarqTrainAdamW",
     "create_optimizer",
+    "optimizer_state_bytes",
     "__version__",
 ]

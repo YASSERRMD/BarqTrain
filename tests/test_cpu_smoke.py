@@ -23,8 +23,10 @@ def test_barqtrain_api_exports():
         PackedCausalLMDataCollator,
         PaddingFreeCausalLMDataCollator,
         apply_activation_checkpointing,
+        BarqTrainAdamW,
         create_optimizer,
         get_activation_checkpoint_preset,
+        optimizer_state_bytes,
         pack_for_causal_lm,
         pack_for_padding_free_causal_lm,
         patch_inference,
@@ -41,7 +43,9 @@ def test_barqtrain_api_exports():
     assert callable(pack_for_causal_lm)
     assert callable(pack_for_padding_free_causal_lm)
     assert callable(apply_activation_checkpointing)
+    assert BarqTrainAdamW is not None
     assert callable(get_activation_checkpoint_preset)
+    assert callable(optimizer_state_bytes)
     assert callable(reset_activation_checkpointing)
     assert callable(create_optimizer)
     assert callable(PackedCausalLMDataCollator)
