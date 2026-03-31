@@ -164,6 +164,40 @@ def test_chunked_cross_entropy_cuda_wrapper_preserves_input_grad_dtypes(monkeypa
     assert lm_head.grad.dtype == lm_head.dtype
 
 
+def test_fused_lm_head_projection_last_token_only_matches_full_projection():
+    """Last-token projection helper should match slicing the full logits tensor."""
+    from barqtrain.ops import fused_lm_head_projection
+
+    hidden = torch.randn(2, 5, 16)
+    lm_head = torch.randn(32, 16)
+
+    full_logits = fused_lm_head_projection(hidden, lm_head)
+    last_token_logits = fused_lm_head_projection(hidden, lm_head, last_token_only=True)
+
+    assert last_token_logits.shape == (2, 1, 32)
+    assert torch.allclose(last_token_logits, full_logits[:, -1:, :], rtol=1e-5, atol=1e-6)
+
+
+def test_fused_lm_head_cross_entropy_loss_matches_manual_shift():
+    """Fused LM-head loss helper should match the manually shifted fallback path."""
+    from barqtrain.ops import fused_lm_head_cross_entropy_loss
+
+    hidden = torch.randn(2, 4, 16)
+    lm_head = torch.randn(32, 16)
+    labels = torch.randint(0, 32, (2, 4))
+    labels[0, 2] = -100
+
+    loss = fused_lm_head_cross_entropy_loss(hidden, lm_head, labels)
+    manual_loss = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(hidden[:, :-1, :], lm_head).reshape(-1, lm_head.size(0)),
+        labels[:, 1:].reshape(-1),
+        reduction="mean",
+        ignore_index=-100,
+    )
+
+    assert torch.allclose(loss, manual_loss, rtol=1e-5, atol=1e-6)
+
+
 def test_patch_model_generic():
     """patch_model returns the model unchanged for generic models."""
     from barqtrain import patch_model
