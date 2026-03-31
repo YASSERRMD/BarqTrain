@@ -115,6 +115,15 @@ class OptimizerBenchmarkProfile:
     num_steps: int
 
 
+@dataclass(frozen=True)
+class RMSNormFusionBenchmarkProfile:
+    name: str
+    batch_size: int
+    sequence_length: int
+    hidden_size: int
+    projection_size: int
+
+
 def generation_overhead_mb(
     resident_snapshot: CudaMemorySnapshot,
     peak_snapshot: CudaMemorySnapshot,
@@ -709,6 +718,74 @@ def phase7_optimizer_profiles(
     ]
 
 
+def phase8_rmsnorm_fusion_profiles(
+    batch_sizes: Sequence[int] = (1, 4, 8),
+    *,
+    sequence_length: int = 512,
+    hidden_size: int = 4096,
+    attention_projection_size: Optional[int] = None,
+    mlp_projection_size: Optional[int] = None,
+) -> list[RMSNormFusionBenchmarkProfile]:
+    """
+    Return the required Phase 8 RMSNorm block-fusion benchmark matrix.
+    """
+    attention_projection_size = (
+        hidden_size if attention_projection_size is None else int(attention_projection_size)
+    )
+    mlp_projection_size = hidden_size * 4 if mlp_projection_size is None else int(mlp_projection_size)
+
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "phase8_rmsnorm_fusion_profiles"):
+        native_profiles = rust_backend.phase8_rmsnorm_fusion_profiles(
+            list(batch_sizes),
+            int(sequence_length),
+            int(hidden_size),
+            int(attention_projection_size),
+            int(mlp_projection_size),
+        )
+        return [
+            RMSNormFusionBenchmarkProfile(
+                name=str(profile.name),
+                batch_size=int(profile.batch_size),
+                sequence_length=int(profile.sequence_length),
+                hidden_size=int(profile.hidden_size),
+                projection_size=int(profile.projection_size),
+            )
+            for profile in native_profiles
+        ]
+
+    profiles: list[RMSNormFusionBenchmarkProfile] = []
+    for batch_size in batch_sizes:
+        profiles.append(
+            RMSNormFusionBenchmarkProfile(
+                name="residual_add_rmsnorm",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                hidden_size=int(hidden_size),
+                projection_size=int(hidden_size),
+            )
+        )
+        profiles.append(
+            RMSNormFusionBenchmarkProfile(
+                name="attention_input_projection",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                hidden_size=int(hidden_size),
+                projection_size=int(attention_projection_size),
+            )
+        )
+        profiles.append(
+            RMSNormFusionBenchmarkProfile(
+                name="mlp_input_projection",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                hidden_size=int(hidden_size),
+                projection_size=int(mlp_projection_size),
+            )
+        )
+    return profiles
+
+
 def _model_forward_parameter_name(
     model: torch.nn.Module,
     candidates: tuple[str, ...],
@@ -822,6 +899,7 @@ __all__ = [
     "PackedTrainingBenchmarkProfile",
     "ActivationCheckpointBenchmarkProfile",
     "OptimizerBenchmarkProfile",
+    "RMSNormFusionBenchmarkProfile",
     "build_generation_kwargs",
     "build_memory_breakdown",
     "capture_cuda_peak_bytes",
@@ -840,6 +918,7 @@ __all__ = [
     "phase5_packed_training_profiles",
     "phase6_activation_checkpoint_profiles",
     "phase7_optimizer_profiles",
+    "phase8_rmsnorm_fusion_profiles",
     "preferred_last_token_logits_kwarg",
     "record_inference_peak_bytes",
     "record_training_peak_bytes",

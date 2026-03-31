@@ -343,6 +343,42 @@ impl OptimizerBenchmarkProfile {
     }
 }
 
+/// Canonical Phase 8 RMSNorm block-fusion benchmark profile.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct RMSNormFusionBenchmarkProfile {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub batch_size: usize,
+    #[pyo3(get)]
+    pub sequence_length: usize,
+    #[pyo3(get)]
+    pub hidden_size: usize,
+    #[pyo3(get)]
+    pub projection_size: usize,
+}
+
+#[pymethods]
+impl RMSNormFusionBenchmarkProfile {
+    #[new]
+    fn new(
+        name: String,
+        batch_size: usize,
+        sequence_length: usize,
+        hidden_size: usize,
+        projection_size: usize,
+    ) -> Self {
+        Self {
+            name,
+            batch_size,
+            sequence_length,
+            hidden_size,
+            projection_size,
+        }
+    }
+}
+
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -675,6 +711,49 @@ fn phase7_optimizer_profiles(
             num_steps: steps,
         },
     ]
+}
+
+/// Emit the required Phase 8 RMSNorm block-fusion benchmark matrix.
+#[pyfunction]
+#[pyo3(signature = (
+    batch_sizes,
+    sequence_length=512,
+    hidden_size=4096,
+    attention_projection_size=4096,
+    mlp_projection_size=16384
+))]
+fn phase8_rmsnorm_fusion_profiles(
+    batch_sizes: Vec<usize>,
+    sequence_length: usize,
+    hidden_size: usize,
+    attention_projection_size: usize,
+    mlp_projection_size: usize,
+) -> Vec<RMSNormFusionBenchmarkProfile> {
+    let mut profiles = Vec::with_capacity(batch_sizes.len() * 3);
+    for batch_size in batch_sizes {
+        profiles.push(RMSNormFusionBenchmarkProfile {
+            name: "residual_add_rmsnorm".to_string(),
+            batch_size,
+            sequence_length,
+            hidden_size,
+            projection_size: hidden_size,
+        });
+        profiles.push(RMSNormFusionBenchmarkProfile {
+            name: "attention_input_projection".to_string(),
+            batch_size,
+            sequence_length,
+            hidden_size,
+            projection_size: attention_projection_size,
+        });
+        profiles.push(RMSNormFusionBenchmarkProfile {
+            name: "mlp_input_projection".to_string(),
+            batch_size,
+            sequence_length,
+            hidden_size,
+            projection_size: mlp_projection_size,
+        });
+    }
+    profiles
 }
 
 /// Pack sequences efficiently using bin-packing algorithm
@@ -1176,6 +1255,7 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PackedTrainingBenchmarkProfile>()?;
     m.add_class::<ActivationCheckpointBenchmarkProfile>()?;
     m.add_class::<OptimizerBenchmarkProfile>()?;
+    m.add_class::<RMSNormFusionBenchmarkProfile>()?;
     m.add_class::<PrefetchQueue>()?;
     m.add_function(wrap_pyfunction!(pack_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(pack_for_causal_lm, m)?)?;
@@ -1191,5 +1271,6 @@ fn barqtrain_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase5_packed_training_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase6_activation_checkpoint_profiles, m)?)?;
     m.add_function(wrap_pyfunction!(phase7_optimizer_profiles, m)?)?;
+    m.add_function(wrap_pyfunction!(phase8_rmsnorm_fusion_profiles, m)?)?;
     Ok(())
 }
