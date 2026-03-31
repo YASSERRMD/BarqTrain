@@ -669,3 +669,42 @@ def test_phase9_attention_report_serializes_dispatch_metrics(monkeypatch, tmp_pa
     assert "decode_tokens_per_second" in payload
     assert "memory_overhead_mb" in payload
     assert "max_abs_error" in payload
+
+
+def test_phase10_lora_report_serializes_adapter_metrics(monkeypatch, tmp_path):
+    _install_fake_runtime(monkeypatch)
+
+    harness = BenchmarkHarness(
+        model_name="fake",
+        batch_size=1,
+        sequence_length=8,
+        num_steps=1,
+        output_dir=str(tmp_path),
+        inference_batch_sizes=(1, 4),
+    )
+
+    report = harness.run_phase10_benchmarks()
+
+    assert isinstance(report, BenchmarkReport)
+    assert report.benchmark_suite == "phase10"
+    assert len(report.lora_profiles) == 8
+    assert {profile.scenario_name for profile in report.lora_profiles} == {
+        "dense_chunked_loss",
+        "packed_chunked_loss",
+    }
+    assert {profile.adapter_mode for profile in report.lora_profiles} == {
+        "reference",
+        "barqtrain_fused",
+    }
+    assert all(profile.effective_tokens > 0 for profile in report.lora_profiles)
+    assert all(profile.effective_tokens_per_second > 0.0 for profile in report.lora_profiles)
+    assert all(profile.peak_vram_mb >= 0.0 for profile in report.lora_profiles)
+
+    results_file = harness.save_results(report)
+    payload = results_file.read_text(encoding="utf-8")
+
+    assert results_file.name == "phase10_results.json"
+    assert "adapter_mode" in payload
+    assert "effective_tokens_per_second" in payload
+    assert "peak_vram_mb" in payload
+    assert "loss_delta_vs_reference" in payload

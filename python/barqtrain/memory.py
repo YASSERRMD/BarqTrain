@@ -133,6 +133,14 @@ class AttentionBenchmarkProfile:
     cache_layout: str
 
 
+@dataclass(frozen=True)
+class LoRABenchmarkProfile:
+    name: str
+    batch_size: int
+    sequence_length: int
+    packed_training: bool
+
+
 def generation_overhead_mb(
     resident_snapshot: CudaMemorySnapshot,
     peak_snapshot: CudaMemorySnapshot,
@@ -858,6 +866,51 @@ def phase9_attention_profiles(
     return profiles
 
 
+def phase10_lora_profiles(
+    batch_sizes: Sequence[int] = (1, 4, 8),
+    *,
+    sequence_length: int = 512,
+) -> list[LoRABenchmarkProfile]:
+    """
+    Return the required Phase 10 fused LoRA benchmark matrix.
+    """
+    rust_backend = _get_rust_backend()
+    if rust_backend is not None and hasattr(rust_backend, "phase10_lora_profiles"):
+        native_profiles = rust_backend.phase10_lora_profiles(
+            list(batch_sizes),
+            int(sequence_length),
+        )
+        return [
+            LoRABenchmarkProfile(
+                name=str(profile.name),
+                batch_size=int(profile.batch_size),
+                sequence_length=int(profile.sequence_length),
+                packed_training=bool(profile.packed_training),
+            )
+            for profile in native_profiles
+        ]
+
+    profiles: list[LoRABenchmarkProfile] = []
+    for batch_size in batch_sizes:
+        profiles.append(
+            LoRABenchmarkProfile(
+                name="dense_chunked_loss",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                packed_training=False,
+            )
+        )
+        profiles.append(
+            LoRABenchmarkProfile(
+                name="packed_chunked_loss",
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                packed_training=True,
+            )
+        )
+    return profiles
+
+
 def _model_forward_parameter_name(
     model: torch.nn.Module,
     candidates: tuple[str, ...],
@@ -973,6 +1026,7 @@ __all__ = [
     "OptimizerBenchmarkProfile",
     "RMSNormFusionBenchmarkProfile",
     "AttentionBenchmarkProfile",
+    "LoRABenchmarkProfile",
     "build_generation_kwargs",
     "build_memory_breakdown",
     "capture_cuda_peak_bytes",
@@ -993,6 +1047,7 @@ __all__ = [
     "phase7_optimizer_profiles",
     "phase8_rmsnorm_fusion_profiles",
     "phase9_attention_profiles",
+    "phase10_lora_profiles",
     "preferred_last_token_logits_kwarg",
     "record_inference_peak_bytes",
     "record_training_peak_bytes",
