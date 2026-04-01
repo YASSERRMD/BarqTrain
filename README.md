@@ -1,5 +1,7 @@
 # BarqTrain
 
+![BarqTrain cover](assets/repo-cover-social.png)
+
 BarqTrain is a native acceleration layer for decoder-only LLM training and inference. It keeps Python as the user-facing control plane while moving hot-path work into Rust and CUDA/C++.
 
 The project currently ships the ten planned implementation phases tracked in this repository:
